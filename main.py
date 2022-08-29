@@ -105,9 +105,8 @@ class PosReconCLR(LightningModule):
         return self.loss_ratio * loss_recon + loss_clr
 
     def validation_step(self, batch, batch_idx):
-        (img1, img2, _), y = batch
-        img = torch.cat((img1, img2))
         *_, loss_recon, loss_clr = self.shared_step(batch)
+
         self.log_dict({
             'loss/recon/val': loss_recon,
             'loss/clr/val': loss_clr,
