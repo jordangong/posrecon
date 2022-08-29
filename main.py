@@ -96,10 +96,8 @@ class PosReconCLR(LightningModule):
         latent, pos_embed_pred, proj_embed, loss_recon, loss_clr = self.shared_step(batch)
 
         self.log_dict({
-            'loss': {
-                'recon/train': loss_recon,
-                'clr/train': loss_clr,
-            },
+            'loss/recon/train': loss_recon,
+            'loss/clr/train': loss_clr,
             'norm/latent': latent.norm(dim=-1).mean(),
             'norm/pos_embed_pred': pos_embed_pred.norm(dim=-1).mean(),
             'norm/proj_embed': proj_embed.norm(dim=-1).mean(),
@@ -111,10 +109,8 @@ class PosReconCLR(LightningModule):
         img = torch.cat((img1, img2))
         *_, loss_recon, loss_clr = self.shared_step(batch)
         self.log_dict({
-            'loss': {
-                'recon/val': loss_recon,
-                'clr/val': loss_clr,
-            },
+            'loss/recon/val': loss_recon,
+            'loss/clr/val': loss_clr,
         }, sync_dist=True)
         return self.loss_ratio * loss_recon + loss_clr
 
@@ -276,7 +272,7 @@ if __name__ == '__main__':
     model = PosReconCLR(**args.__dict__)
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    model_checkpoint = ModelCheckpoint(save_last=True, save_top_k=1, monitor="clr/val")
+    model_checkpoint = ModelCheckpoint(save_last=True, save_top_k=1, monitor="loss/clr/val")
     callbacks = [model_checkpoint, lr_monitor]
 
     trainer = Trainer(
@@ -285,7 +281,7 @@ if __name__ == '__main__':
         devices=args.gpus if args.gpus > 0 else None,
         num_nodes=args.num_nodes,
         accelerator="gpu" if args.gpus > 0 else None,
-        strategy="ddp" if args.gpus > 1 else None,
+        strategy="ddp_find_unused_parameters_false" if args.gpus > 1 else None,
         sync_batchnorm=True if args.gpus > 1 else False,
         precision=32 if args.fp32 else 16,
         callbacks=callbacks,
