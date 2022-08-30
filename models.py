@@ -1,13 +1,9 @@
-from pathlib import Path
+from typing import Callable
 
-import math
 import torch
 import torch.nn.functional as F
-from timm.models.helpers import named_apply, checkpoint_seq
-from timm.models.layers import trunc_normal_
-from timm.models.vision_transformer import VisionTransformer, get_init_weights_vit, PatchEmbed, Block
+from timm.models.vision_transformer import PatchEmbed, Block
 from torch import nn
-from typing import Callable
 
 from pos_embed import get_2d_sincos_pos_embed
 
@@ -146,8 +142,6 @@ class MaskedPosReconCLRViT(nn.Module):
         noise = torch.rand(batch_size, seq_len, device=x.device)
         shuffled_indices = noise.argsort()
         # shuffled_indices: [batch_size, seq_len]
-        unshuffled_indices = shuffled_indices.argsort()
-        # unshuffled_indices: [batch_size, seq_len]
         visible_indices = shuffled_indices[:, :visible_len]
         # visible_indices: [batch_size, seq_len * mask_ratio]
         expand_visible_indices = visible_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
@@ -244,4 +238,3 @@ class MaskedPosReconCLRViT(nn.Module):
         # reps: [batch_size*2, proj_dim]
         loss_recon, loss_clr = self.forward_loss(pos_pred, vis_ids, feat, temp)
         return latent, pos_pred, feat, loss_recon, loss_clr
-

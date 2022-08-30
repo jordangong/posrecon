@@ -136,7 +136,8 @@ class PosReconCLR(LightningModule):
 
     def configure_optimizers(self):
         if self.exclude_bn_bias:
-            params = self.exclude_from_wt_decay(self.named_parameters(), weight_decay=self.weight_decay)
+            params = self.exclude_from_wt_decay(self.named_parameters(),
+                                                weight_decay=self.weight_decay)
         else:
             params = self.parameters()
 
@@ -149,7 +150,8 @@ class PosReconCLR(LightningModule):
                 trust_coefficient=0.001,
             )
         elif self.optim == "adam":
-            optimizer = torch.optim.Adam(params, lr=self.learning_rate, weight_decay=self.weight_decay)
+            optimizer = torch.optim.Adam(params, lr=self.learning_rate,
+                                         weight_decay=self.weight_decay)
 
         warmup_steps = self.train_iters_per_epoch * self.warmup_epochs
         total_steps = self.train_iters_per_epoch * self.max_epochs
@@ -252,7 +254,7 @@ if __name__ == '__main__':
         args.num_samples = dm.num_samples
         args.input_height = dm.dims[-1]
     else:
-        raise NotImplementedError("other datasets have not been implemented till now")
+        raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
 
     dm.train_transforms = SimCLRTrainDataTransform(
         input_height=args.input_height,
@@ -271,7 +273,7 @@ if __name__ == '__main__':
     model = PosReconCLR(**args.__dict__)
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    model_checkpoint = ModelCheckpoint(save_last=True, save_top_k=1, monitor="loss/clr/val")
+    model_checkpoint = ModelCheckpoint(save_last=True, monitor="loss/clr/val")
     callbacks = [model_checkpoint, lr_monitor]
 
     trainer = Trainer(
