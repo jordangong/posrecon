@@ -121,49 +121,53 @@ class PosReconCLREval(SSLFineTuner):
 
         return [optimizer], [scheduler]
 
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        parser = ArgumentParser(parents=[parent_parser], add_help=False)
+
+        # i/o params
+        parser.add_argument("--dataset", type=str, default="imagenet",
+                            help="dataset")
+        parser.add_argument("--data_dir", type=str, default="dataset",
+                            help="path to dataset")
+        parser.add_argument("--protocol", type=str, default="linear",
+                            choices=("linear", "finetune"),
+                            help="evalution protocol")
+        parser.add_argument("--label_pct", type=int, default=100,
+                            help="% of labels for training")
+        parser.add_argument("--ckpt_path", type=str, help="path to ckpt")
+
+        # training params
+        parser.add_argument("--num_nodes", default=1, type=int,
+                            help="number of nodes for training")
+        parser.add_argument("--gpus", default=1, type=int,
+                            help="number of gpus to train on")
+        parser.add_argument("--num_workers", default=8, type=int,
+                            help="num of workers per GPU")
+        parser.add_argument("--max_epochs", default=100, type=int,
+                            help="number of total epochs to run")
+        parser.add_argument("--max_steps", default=-1, type=int,
+                            help="max steps")
+        parser.add_argument("--batch_size", default=256, type=int,
+                            help="batch size per gpu")
+        parser.add_argument("--fp32", default=True, action=BooleanOptionalAction,
+                            help="use fp32 or fp16")
+        parser.add_argument("--fast_dev_run", default=False, type=int)
+
+        # fine-tuner params
+        parser.add_argument("--dropout", type=float, default=0.0)
+        parser.add_argument("--learning_rate", type=float, default=0.1)
+        parser.add_argument("--weight_decay", type=float, default=1e-6)
+        parser.add_argument("--label_smoothing", type=float, default=0.0)
+        parser.add_argument("--nesterov", type=bool, default=False)
+        parser.add_argument("--scheduler_type", type=str, default="cosine")
+        parser.add_argument("--gamma", type=float, default=0.1)
+        parser.add_argument("--final_lr", type=float, default=0.0)
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-
-    # i/o params
-    parser.add_argument("--dataset", type=str, default="imagenet",
-                        help="dataset")
-    parser.add_argument("--data_dir", type=str, default="dataset",
-                        help="path to dataset")
-    parser.add_argument("--protocol", type=str, default="linear",
-                        choices=("linear", "finetune"),
-                        help="evalution protocol")
-    parser.add_argument("--label_pct", type=int, default=100,
-                        help="% of labels for training")
-    parser.add_argument("--ckpt_path", type=str, help="path to ckpt")
-
-    # training params
-    parser.add_argument("--num_nodes", default=1, type=int,
-                        help="number of nodes for training")
-    parser.add_argument("--gpus", default=1, type=int,
-                        help="number of gpus to train on")
-    parser.add_argument("--num_workers", default=8, type=int,
-                        help="num of workers per GPU")
-    parser.add_argument("--max_epochs", default=100, type=int,
-                        help="number of total epochs to run")
-    parser.add_argument("--max_steps", default=-1, type=int,
-                        help="max steps")
-    parser.add_argument("--batch_size", default=256, type=int,
-                        help="batch size per gpu")
-    parser.add_argument("--fp32", default=True, action=BooleanOptionalAction,
-                        help="use fp32 or fp16")
-    parser.add_argument("--fast_dev_run", default=False, type=int)
-
-    # fine-tuner params
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--learning_rate", type=float, default=0.1)
-    parser.add_argument("--weight_decay", type=float, default=1e-6)
-    parser.add_argument("--label_smoothing", type=float, default=0.0)
-    parser.add_argument("--nesterov", type=bool, default=False)
-    parser.add_argument("--scheduler_type", type=str, default="cosine")
-    parser.add_argument("--gamma", type=float, default=0.1)
-    parser.add_argument("--final_lr", type=float, default=0.0)
-
+    parser = PosReconCLREval.add_model_specific_args(parser)
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
