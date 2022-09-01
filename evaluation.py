@@ -134,7 +134,7 @@ class PosReconCLREval(SSLFineTuner):
                             choices=("linear", "finetune"),
                             help="evalution protocol")
         parser.add_argument("--label_pct", type=int, default=100,
-                            help="% of labels for training")
+                            help="%% of labels for training")
         parser.add_argument("--ckpt_path", type=str, help="path to ckpt")
 
         # training params
