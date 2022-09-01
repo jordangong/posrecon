@@ -164,6 +164,8 @@ class PosReconCLREval(SSLFineTuner):
         parser.add_argument("--gamma", type=float, default=0.1)
         parser.add_argument("--final_lr", type=float, default=0.0)
 
+        return parser
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
