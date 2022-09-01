@@ -228,7 +228,7 @@ if __name__ == "__main__":
     lr_monitor = LearningRateMonitor(logging_interval="step")
     model_checkpoint = ModelCheckpoint(
         save_last=True,
-        save_top_k="acc/{self.protocol}/val_epoch"
+        monitor=f"acc/{args.protocol}/val_epoch"
     )
     callbacks = [model_checkpoint, lr_monitor]
 
