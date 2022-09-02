@@ -36,6 +36,12 @@ class PosReconCLREval(SSLFineTuner):
         self.label_smoothing = label_smoothing
         self.optim = optim
 
+    def on_train_epoch_start(self) -> None:
+        if self.protocol == 'linear':
+            self.backbone.eval()
+        elif self.protocol == 'finetune':
+            self.backbone.train()
+
     def forward_backbone(self, x):
         x = self.backbone.patch_embed(x)
         x += self.backbone.pos_embed
