@@ -242,7 +242,7 @@ if __name__ == "__main__":
         devices=args.gpus if args.gpus > 0 else None,
         num_nodes=args.num_nodes,
         accelerator="gpu" if args.gpus > 0 else None,
-        strategy="ddp_find_unused_parameters_false" if args.gpus > 1 else None,
+        strategy="ddp" if args.gpus > 1 else None,
         sync_batchnorm=True if args.gpus > 1 else False,
         precision=32 if args.fp32 else 16,
         callbacks=callbacks,
