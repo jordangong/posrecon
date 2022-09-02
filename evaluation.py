@@ -156,6 +156,7 @@ class PosReconCLREval(SSLFineTuner):
 
         # fine-tuner params
         parser.add_argument("--dropout", type=float, default=0.0)
+        parser.add_argument("--optimizer", type=str, default="sgd")
         parser.add_argument("--learning_rate", type=float, default=0.1)
         parser.add_argument("--weight_decay", type=float, default=1e-6)
         parser.add_argument("--label_smoothing", type=float, default=0.0)
@@ -218,6 +219,7 @@ if __name__ == "__main__":
         num_classes=dm.num_classes,
         epochs=args.max_epochs,
         dropout=args.dropout,
+        optim=args.optimizer,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         label_smoothing=args.label_smoothing,
