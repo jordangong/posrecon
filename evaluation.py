@@ -31,6 +31,7 @@ class PosReconCLREval(SSLFineTuner):
         assert optim in {'sgd', 'adam'}, f"unknown optimizer: {optim}"
 
         super().__init__(**kwargs)
+        self.save_hyperparameters(ignore=['backbone'])
 
         self.protocol = protocol
         self.label_smoothing = label_smoothing
