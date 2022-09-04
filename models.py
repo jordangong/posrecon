@@ -151,12 +151,20 @@ class MaskedPosReconCLRViT(nn.Module):
 
         return x_masked, expand_visible_indices
 
-    def forward_encoder(self, x, mask_ratio):
+    def forward_encoder(self, x, shuffle, mask_ratio):
         x = self.patch_embed(x)
 
-        x = self.rand_shuffle(x, self.pos_embed)
+        if shuffle:
+            x = self.rand_shuffle(x, self.pos_embed)
+        else:
+            x += self.pos_embed
         # batch_size*2, seq_len, embed_dim
-        x, visible_indices = self.rand_mask(x, mask_ratio)
+
+        if mask_ratio == 0:
+            # make `visible_indices` empty when all patches are visible
+            visible_indices = None
+        else:
+            x, visible_indices = self.rand_mask(x, mask_ratio)
         # batch_size*2, seq_len * mask_ratio, embed_dim
 
         # Concatenate [CLS] tokens w/o pos_embed
@@ -183,12 +191,16 @@ class MaskedPosReconCLRViT(nn.Module):
         # self.pos_embed: [1, seq_len, embed_dim]
         # batch_pos_embed_pred: [batch_size*2, seq_len, embed_dim]
         # vis_ids: [batch_size*2, seq_len * mask_ratio, embed_dim]
+
         batch_pos_embed_targ = self.pos_embed.expand(batch_size, -1, -1)
         # batch_pos_embed_targ: [batch_size*2, seq_len, embed_dim]
+
         # Only compute loss on visible patches
-        visible_pos_embed_targ = batch_pos_embed_targ.gather(1, vis_ids)
+        if vis_ids is not None:
+            batch_pos_embed_targ = batch_pos_embed_targ.gather(1, vis_ids)
+
         # visible_pos_embed_targ: [batch_size*2, seq_len * mask_ratio, embed_dim]
-        loss = F.mse_loss(batch_pos_embed_pred, visible_pos_embed_targ)
+        loss = F.mse_loss(batch_pos_embed_pred, batch_pos_embed_targ)
         return loss
 
     @staticmethod
@@ -228,9 +240,9 @@ class MaskedPosReconCLRViT(nn.Module):
         loss_clr = self.info_nce_loss(features, temp)
         return loss_recon, loss_clr
 
-    def forward(self, img, mask_ratio=0.75, temp=0.01):
+    def forward(self, img, shuffle=True, mask_ratio=0.75, temp=0.01):
         # img: [batch_size*2, in_chans, height, weight]
-        latent, vis_ids = self.forward_encoder(img, mask_ratio)
+        latent, vis_ids = self.forward_encoder(img, shuffle, mask_ratio)
         # latent: [batch_size*2, 1 + seq_len * mask_ratio, embed_dim]
         pos_pred = self.forward_pos_decoder(latent[:, 1:, :])
         # pos_pred: [batch_size*2, seq_len * mask_ratio, embed_dim]
