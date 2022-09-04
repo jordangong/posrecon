@@ -75,7 +75,8 @@ class PosReconCLREval(SSLFineTuner):
 
         self.log(f"loss/xent_{self.protocol}/train", loss, prog_bar=True)
         self.log(f"acc/{self.protocol}/train_step", acc, prog_bar=True)
-        self.log(f"acc/{self.protocol}/train_epoch", self.train_acc)
+        self.log(f"acc/{self.protocol}/train_epoch", self.train_acc,
+                 on_step=False, on_epoch=True)
 
         return loss
 
