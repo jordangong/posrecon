@@ -22,7 +22,6 @@ class PosReconCLREval(SSLFineTuner):
         label_smoothing: float = 0.,
         optim: str = 'sgd',
         warmup_epochs: int = 10,
-        max_epochs: int = 100,
         start_lr: float = 0.,
         **kwargs
     ):
@@ -42,7 +41,6 @@ class PosReconCLREval(SSLFineTuner):
         self.label_smoothing = label_smoothing
         self.optim = optim
         self.warmup_epochs = warmup_epochs
-        self.max_epochs = max_epochs
         self.start_lr = start_lr
 
     def on_train_epoch_start(self) -> None:
@@ -136,7 +134,7 @@ class PosReconCLREval(SSLFineTuner):
             )
         elif self.scheduler_type == "warmup-anneal":
             scheduler = LinearWarmupCosineAnnealingLR(
-                optimizer, self.warmup_epochs, self.max_epochs,
+                optimizer, self.warmup_epochs, max_epochs=self.epochs,
                 warmup_start_lr=self.start_lr, eta_min=self.final_lr
             )
 
@@ -252,7 +250,6 @@ if __name__ == "__main__":
         scheduler_type=args.scheduler_type,
         gamma=args.gamma,
         warmup_epochs=args.warmup_epochs,
-        max_epochs=args.max_epochs,
         start_lr=args.start_lr,
         final_lr=args.final_lr,
     )
