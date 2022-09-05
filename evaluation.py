@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from pl_bolts.datamodules import ImagenetDataModule
 from pl_bolts.models.self_supervised import SSLFineTuner
 from pl_bolts.models.self_supervised.simclr.transforms import SimCLRFinetuneTransform
+from pl_bolts.optimizers import LinearWarmupCosineAnnealingLR
 from pl_bolts.transforms.dataset_normalizations import imagenet_normalization
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -20,6 +21,9 @@ class PosReconCLREval(SSLFineTuner):
         protocol: str = 'linear',
         label_smoothing: float = 0.,
         optim: str = 'sgd',
+        warmup_epochs: int = 10,
+        max_epochs: int = 100,
+        start_lr: float = 0.,
         **kwargs
     ):
         """
@@ -37,6 +41,9 @@ class PosReconCLREval(SSLFineTuner):
         self.protocol = protocol
         self.label_smoothing = label_smoothing
         self.optim = optim
+        self.warmup_epochs = warmup_epochs
+        self.max_epochs = max_epochs
+        self.start_lr = start_lr
 
     def on_train_epoch_start(self) -> None:
         if self.protocol == 'linear':
@@ -127,6 +134,11 @@ class PosReconCLREval(SSLFineTuner):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, self.epochs, eta_min=self.final_lr  # total epochs to run
             )
+        elif self.scheduler_type == "warmup-anneal":
+            scheduler = LinearWarmupCosineAnnealingLR(
+                optimizer, self.warmup_epochs, self.max_epochs,
+                warmup_start_lr=self.start_lr, eta_min=self.final_lr
+            )
 
         return [optimizer], [scheduler]
 
@@ -159,6 +171,8 @@ class PosReconCLREval(SSLFineTuner):
                             help="max steps")
         parser.add_argument("--batch_size", default=256, type=int,
                             help="batch size per gpu")
+        parser.add_argument("--warmup_epochs", default=10, type=int,
+                            help="number of warmup epochs")
         parser.add_argument("--fp32", default=True, action=BooleanOptionalAction,
                             help="use fp32 or fp16")
         parser.add_argument("--fast_dev_run", default=False, type=int)
@@ -170,9 +184,10 @@ class PosReconCLREval(SSLFineTuner):
         parser.add_argument("--weight_decay", type=float, default=1e-6)
         parser.add_argument("--label_smoothing", type=float, default=0.0)
         parser.add_argument("--nesterov", type=bool, default=False)
-        parser.add_argument("--scheduler_type", type=str, default="cosine")
+        parser.add_argument("--scheduler_type", type=str, default="warmup-anneal")
         parser.add_argument("--gamma", type=float, default=0.1)
-        parser.add_argument("--final_lr", type=float, default=0.0)
+        parser.add_argument("--start_lr", type=float, default=0.0)
+        parser.add_argument("--final_lr", type=float, default=1e-6)
 
         return parser
 
@@ -236,6 +251,9 @@ if __name__ == "__main__":
         nesterov=args.nesterov,
         scheduler_type=args.scheduler_type,
         gamma=args.gamma,
+        warmup_epochs=args.warmup_epochs,
+        max_epochs=args.max_epochs,
+        start_lr=args.start_lr,
         final_lr=args.final_lr,
     )
 
