@@ -186,7 +186,7 @@ class PosReconCLREval(SSLFineTuner):
         parser.add_argument("--nesterov", type=bool, default=False)
         parser.add_argument("--scheduler_type", type=str, default="warmup-anneal")
         parser.add_argument("--gamma", type=float, default=0.1)
-        parser.add_argument("--start_lr", type=float, default=0.0)
+        parser.add_argument("--start_lr", type=float, default=1e-6)
         parser.add_argument("--final_lr", type=float, default=1e-6)
 
         return parser
