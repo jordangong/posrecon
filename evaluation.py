@@ -261,7 +261,7 @@ if __name__ == "__main__":
     lr_monitor = LearningRateMonitor(logging_interval="step")
     model_checkpoint = ModelCheckpoint(
         save_last=True,
-        monitor=f"acc/{args.protocol}/val_epoch"
+        monitor=f"loss/xent_{args.protocol}/val"
     )
     callbacks = [model_checkpoint, lr_monitor]
 
