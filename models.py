@@ -49,6 +49,9 @@ class MaskedPosReconCLRViT(nn.Module):
             num_heads: int = 12,
             mlp_ratio: int = 4,
             proj_dim: int = 128,
+            drop_rate: float = 0.,
+            attention_drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
             norm_layer: Callable = nn.LayerNorm,
     ):
         """
@@ -61,6 +64,9 @@ class MaskedPosReconCLRViT(nn.Module):
             num_heads: number of self-attention heads
             mlp_ratio: MLP dimension ratio (mlp_dim = embed_dim * mlp_ratio)
             proj_dim: projection head output dimension
+            drop_rate: dropout rate
+            attention_drop_rate: attention dropout rate
+            drop_path_rate: stochastic depth rate
             norm_layer: normalization layer
         """
         super(MaskedPosReconCLRViT, self).__init__()
@@ -74,10 +80,11 @@ class MaskedPosReconCLRViT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim),
                                       requires_grad=False)
 
-        self.blocks = nn.Sequential(*[
-            Block(embed_dim, num_heads, mlp_ratio,
-                  qkv_bias=True, norm_layer=norm_layer)
-            for _ in range(depth)
+        self.blocks = nn.Sequential(*[Block(
+            embed_dim, num_heads, mlp_ratio, qkv_bias=True,
+            drop=drop_rate, attn_drop=attention_drop_rate, drop_path=dpr.item(),
+            norm_layer=norm_layer
+        ) for dpr in torch.linspace(0, drop_path_rate, depth)
         ])
         self.norm = norm_layer(embed_dim)
 

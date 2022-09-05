@@ -79,7 +79,7 @@ class PosReconCLR(LightningModule):
             num_heads,
             mlp_ratio,
             proj_dim,
-            partial(nn.LayerNorm, eps=1e-6),
+            norm_layer=partial(nn.LayerNorm, eps=1e-6),
         )
 
         # compute iters per epoch
