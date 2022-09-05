@@ -93,24 +93,28 @@ class PosReconCLR(LightningModule):
 
     def training_step(self, batch, batch_idx):
         latent, pos_embed_pred, proj_embed, loss_recon, loss_clr = self.shared_step(batch)
+        loss = self.loss_ratio * loss_recon + loss_clr
 
         self.log_dict({
+            'loss/pretrain/train': loss,
             'loss/recon/train': loss_recon,
             'loss/clr/train': loss_clr,
             'norm/latent': latent.norm(dim=-1).mean(),
             'norm/pos_embed_pred': pos_embed_pred.norm(dim=-1).mean(),
             'norm/proj_embed': proj_embed.norm(dim=-1).mean(),
         }, sync_dist=True)
-        return self.loss_ratio * loss_recon + loss_clr
+        return loss
 
     def validation_step(self, batch, batch_idx):
         *_, loss_recon, loss_clr = self.shared_step(batch)
+        loss = self.loss_ratio * loss_recon + loss_clr
 
         self.log_dict({
+            'loss/pretrain/val': loss,
             'loss/recon/val': loss_recon,
             'loss/clr/val': loss_clr,
         }, sync_dist=True)
-        return self.loss_ratio * loss_recon + loss_clr
+        return loss
 
     @staticmethod
     def exclude_from_wt_decay(named_params, weight_decay, skip_list=("bias", "bn")):
@@ -272,7 +276,7 @@ if __name__ == '__main__':
 
     logger = TensorBoardLogger("lightning_logs", name="pretrain", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    model_checkpoint = ModelCheckpoint(save_last=True, monitor="loss/clr/val")
+    model_checkpoint = ModelCheckpoint(save_last=True, monitor="loss/pretrain/val")
     callbacks = [model_checkpoint, lr_monitor]
 
     trainer = Trainer(
