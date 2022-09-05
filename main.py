@@ -37,9 +37,7 @@ class PosReconCLR(LightningModule):
             loss_ratio: float = 1.,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
-            start_lr: float = 0.0,
             learning_rate: float = 1e-3,
-            final_lr: float = 0.0,
             weight_decay: float = 1e-6,
             **kwargs
     ):
@@ -68,8 +66,6 @@ class PosReconCLR(LightningModule):
         self.temperature = temperature
         self.loss_ratio = loss_ratio
 
-        self.start_lr = start_lr
-        self.final_lr = final_lr
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
@@ -238,10 +234,6 @@ class PosReconCLR(LightningModule):
                             help="weight decay")
         parser.add_argument("--learning_rate", default=1e-3, type=float,
                             help="base learning rate")
-        parser.add_argument("--start_lr", default=0, type=float,
-                            help="initial warmup learning rate")
-        parser.add_argument("--final_lr", type=float, default=1e-6,
-                            help="final learning rate")
 
         return parser
 
