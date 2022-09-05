@@ -8,6 +8,7 @@ from pl_bolts.optimizers import linear_warmup_decay, LARS
 from pl_bolts.transforms.dataset_normalizations import imagenet_normalization
 from pytorch_lightning import Trainer, LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 
 from models import MaskedPosReconCLRViT
@@ -247,6 +248,7 @@ class PosReconCLR(LightningModule):
 
 if __name__ == '__main__':
     paser = ArgumentParser()
+    paser.add_argument("--version", default=None, type=str)
     paser = PosReconCLR.add_model_specific_args(paser)
     args = paser.parse_args()
 
@@ -276,6 +278,7 @@ if __name__ == '__main__':
 
     model = PosReconCLR(**args.__dict__)
 
+    logger = TensorBoardLogger("lightning_logs", name="pretrain", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")
     model_checkpoint = ModelCheckpoint(save_last=True, monitor="loss/clr/val")
     callbacks = [model_checkpoint, lr_monitor]
@@ -290,6 +293,7 @@ if __name__ == '__main__':
         sync_batchnorm=True if args.gpus > 1 else False,
         precision=32 if args.fp32 else 16,
         callbacks=callbacks,
+        logger=logger,
         fast_dev_run=args.fast_dev_run,
     )
 

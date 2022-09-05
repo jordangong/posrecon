@@ -8,6 +8,7 @@ from pl_bolts.models.self_supervised.simclr.transforms import SimCLRFinetuneTran
 from pl_bolts.transforms.dataset_normalizations import imagenet_normalization
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
 
 from datamodules import FewShotImagenetDataModule
 from main import PosReconCLR
@@ -178,6 +179,7 @@ class PosReconCLREval(SSLFineTuner):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
+    parser.add_argument("--version", default=None, type=str)
     parser = PosReconCLREval.add_model_specific_args(parser)
     args = parser.parse_args()
 
@@ -237,6 +239,7 @@ if __name__ == "__main__":
         final_lr=args.final_lr,
     )
 
+    logger = TensorBoardLogger("lightning_logs", name="evaluation", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")
     model_checkpoint = ModelCheckpoint(
         save_last=True,
@@ -254,6 +257,7 @@ if __name__ == "__main__":
         sync_batchnorm=True if args.gpus > 1 else False,
         precision=32 if args.fp32 else 16,
         callbacks=callbacks,
+        logger=logger,
         fast_dev_run=args.fast_dev_run,
     )
 
