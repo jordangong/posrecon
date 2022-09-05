@@ -280,4 +280,4 @@ if __name__ == "__main__":
     )
 
     trainer.fit(evaluator, datamodule=dm)
-    trainer.test(dataloaders=dm)
+    trainer.test(dataloaders=dm, ckpt_path='last')
