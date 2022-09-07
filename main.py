@@ -29,6 +29,9 @@ class PosReconCLR(LightningModule):
             num_heads: int = 12,
             mlp_ratio: int = 4,
             proj_dim: int = 128,
+            drop_rate: float = 0.,
+            attention_drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
             warmup_epochs: int = 10,
             max_epochs: int = 100,
             position: bool = True,
@@ -58,6 +61,9 @@ class PosReconCLR(LightningModule):
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
         self.proj_dim = proj_dim
+        self.drop_rate = drop_rate
+        self.attention_drop_rate = attention_drop_rate
+        self.drop_path_rate = drop_path_rate
 
         self.optim = optimizer
         self.exclude_bn_bias = exclude_bn_bias
@@ -81,7 +87,10 @@ class PosReconCLR(LightningModule):
             num_heads,
             mlp_ratio,
             proj_dim,
-            norm_layer=partial(nn.LayerNorm, eps=1e-6),
+            drop_rate,
+            attention_drop_rate,
+            drop_path_rate,
+            partial(nn.LayerNorm, eps=1e-6),
         )
 
         # compute iters per epoch
@@ -194,6 +203,12 @@ class PosReconCLR(LightningModule):
                             help="Ratio of embedding dim to MLP dim")
         parser.add_argument("--proj_dim", default=128, type=int,
                             help="projection head output dimension")
+        parser.add_argument("--mlp_dropout", default=0.0, type=float,
+                            help="mlp dropout rate")
+        parser.add_argument("--attention_dropout", default=0.0, type=float,
+                            help="attention dropout rate")
+        parser.add_argument("--path_dropout", default=0.0, type=float,
+                            help="path dropout rate")
         parser.add_argument("--fp32", default=True, action=BooleanOptionalAction,
                             help="use fp32 or fp16")
 

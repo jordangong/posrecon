@@ -1,4 +1,5 @@
 from argparse import ArgumentParser, BooleanOptionalAction
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -10,9 +11,11 @@ from pl_bolts.transforms.dataset_normalizations import imagenet_normalization
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
+from torch import nn
 
 from datamodules import FewShotImagenetDataModule
 from main import PosReconCLR
+from models import MaskedPosReconCLRViT
 
 
 class PosReconCLREval(SSLFineTuner):
@@ -176,7 +179,10 @@ class PosReconCLREval(SSLFineTuner):
         parser.add_argument("--fast_dev_run", default=False, type=int)
 
         # fine-tuner params
-        parser.add_argument("--dropout", type=float, default=0.0)
+        parser.add_argument("--mlp_dropout", type=float, default=0.0)
+        parser.add_argument("--attention_dropout", type=float, default=0.0)
+        parser.add_argument("--path_dropout", type=float, default=0.0)
+        parser.add_argument("--head_dropout", type=float, default=0.0)
         parser.add_argument("--optimizer", type=str, default="sgd")
         parser.add_argument("--learning_rate", type=float, default=0.1)
         parser.add_argument("--weight_decay", type=float, default=1e-6)
@@ -229,11 +235,24 @@ if __name__ == "__main__":
         eval_transform=True,
     )
 
-    pretrained = PosReconCLR(
-        gpus=args.gpus,
-        num_samples=1,
-        batch_size=args.batch_size,
-    ).load_from_checkpoint(args.ckpt_path, strict=False)
+    pretrained = PosReconCLR.load_from_checkpoint(args.ckpt_path, strict=False)
+    pretained_state_dict = pretrained.state_dict()
+    # a bit hacky here, replace backbone with dropout rate
+    pretrained.model = MaskedPosReconCLRViT(
+        pretrained.img_size,
+        pretrained.patch_size,
+        pretrained.in_chans,
+        pretrained.embed_dim,
+        pretrained.depth,
+        pretrained.num_heads,
+        pretrained.mlp_ratio,
+        pretrained.proj_dim,
+        drop_rate=args.mlp_dropout,
+        attention_drop_rate=args.attention_dropout,
+        drop_path_rate=args.path_dropout,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+    )
+    pretrained.load_state_dict(pretained_state_dict)
 
     evaluator = PosReconCLREval(
         protocol=args.protocol,
@@ -241,7 +260,7 @@ if __name__ == "__main__":
         in_features=pretrained.embed_dim,
         num_classes=dm.num_classes,
         epochs=args.max_epochs,
-        dropout=args.dropout,
+        dropout=args.head_dropout,
         optim=args.optimizer,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
