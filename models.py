@@ -158,13 +158,14 @@ class MaskedPosReconCLRViT(nn.Module):
 
         return x_masked, expand_visible_indices
 
-    def forward_encoder(self, x, shuffle, mask_ratio):
+    def forward_encoder(self, x, position, shuffle, mask_ratio):
         x = self.patch_embed(x)
 
-        if shuffle:
-            x = self.rand_shuffle(x, self.pos_embed)
-        else:
-            x += self.pos_embed
+        if position:
+            if shuffle:
+                x = self.rand_shuffle(x, self.pos_embed)
+            else:
+                x += self.pos_embed
         # batch_size*2, seq_len, embed_dim
 
         if mask_ratio == 0:
@@ -247,9 +248,9 @@ class MaskedPosReconCLRViT(nn.Module):
         loss_clr = self.info_nce_loss(features, temp)
         return loss_recon, loss_clr
 
-    def forward(self, img, shuffle=True, mask_ratio=0.75, temp=0.01):
+    def forward(self, img, position=True, shuffle=True, mask_ratio=0.75, temp=0.01):
         # img: [batch_size*2, in_chans, height, weight]
-        latent, vis_ids = self.forward_encoder(img, shuffle, mask_ratio)
+        latent, vis_ids = self.forward_encoder(img, position, shuffle, mask_ratio)
         # latent: [batch_size*2, 1 + seq_len * mask_ratio, embed_dim]
         pos_pred = self.forward_pos_decoder(latent[:, 1:, :])
         # pos_pred: [batch_size*2, seq_len * mask_ratio, embed_dim]

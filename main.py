@@ -31,6 +31,7 @@ class PosReconCLR(LightningModule):
             proj_dim: int = 128,
             warmup_epochs: int = 10,
             max_epochs: int = 100,
+            position: bool = True,
             shuffle: bool = True,
             mask_ratio: float = 0.75,
             temperature: float = 0.1,
@@ -61,6 +62,7 @@ class PosReconCLR(LightningModule):
         self.optim = optimizer
         self.exclude_bn_bias = exclude_bn_bias
         self.weight_decay = weight_decay
+        self.position = position
         self.shuffle = shuffle
         self.mask_ratio = mask_ratio
         self.temperature = temperature
@@ -89,7 +91,8 @@ class PosReconCLR(LightningModule):
     def shared_step(self, batch):
         (img1, img2, _), _ = batch
         img = torch.cat((img1, img2))
-        return self.model(img, self.shuffle, self.mask_ratio, self.temperature)
+        return self.model(img, self.position, self.shuffle,
+                          self.mask_ratio, self.temperature)
 
     def training_step(self, batch, batch_idx):
         latent, pos_embed_pred, proj_embed, loss_recon, loss_clr = self.shared_step(batch)
@@ -226,6 +229,8 @@ class PosReconCLR(LightningModule):
         parser.add_argument("--batch_size", default=128, type=int,
                             help="batch size per gpu")
 
+        parser.add_argument("--position", default=True, action=BooleanOptionalAction,
+                            help="add positional embedding or not")
         parser.add_argument("--shuffle", default=True, action=BooleanOptionalAction,
                             help="shuffle patches or not")
         parser.add_argument("--mask_ratio", default=0.75, type=float,
