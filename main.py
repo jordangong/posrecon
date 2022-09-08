@@ -232,7 +232,7 @@ class PosReconCLR(LightningModule):
                             help="num of workers per GPU")
         parser.add_argument("--optimizer", default="adam", type=str,
                             help="choose between adam/lars")
-        parser.add_argument("--exclude_bn_bias", default=True,
+        parser.add_argument("--exclude_bn_bias", default=False,
                             action=BooleanOptionalAction,
                             help="exclude bn/bias from weight decay")
         parser.add_argument("--max_epochs", default=100, type=int,
