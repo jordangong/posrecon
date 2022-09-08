@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch import nn
 
-from pos_embed import get_2d_sincos_pos_embed
+from utils.pos_embed import get_2d_sincos_pos_embed
 
 
 class SyncFunction(torch.autograd.Function):

@@ -13,9 +13,9 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 
-from datamodules import FewShotImagenetDataModule
 from main import PosReconCLR
 from models import MaskedPosReconCLRViT
+from utils.datamodules import FewShotImagenetDataModule
 
 
 class PosReconCLREval(SSLFineTuner):
