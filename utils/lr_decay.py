@@ -1,18 +1,12 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
+# Modified from Masked Autoencoder: https://github.com/facebookresearch/mae/blob/efb2a8062c206524e35e47d04501ed4f544c0ae8/util/lr_decay.py
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
 # References:
 # ELECTRA https://github.com/google-research/electra
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
-# --------------------------------------------------------
+# MAE: https://github.com/facebookresearch/mae
 
-import json
-
-
-def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_decay=.75):
+def param_groups_lrd(model, weight_decay=1e-6, exclude_1d_params=True,
+                     no_weight_decay_list=(), layer_decay=0.):
     """
     Parameter groups for layer-wise lr decay
     Following BEiT: https://github.com/microsoft/unilm/blob/master/beit/optim_factory.py#L58
@@ -22,22 +16,24 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
 
     num_layers = len(model.blocks) + 1
 
-    layer_scales = list(layer_decay ** (num_layers - i) for i in range(num_layers + 1))
+    layer_scales = list(layer_decay ** (num_layers - i)
+                        for i in range(num_layers + 1))
 
-    for n, p in model.named_parameters():
-        if not p.requires_grad:
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
             continue
 
-        # no decay: all 1D parameters and model specific ones
-        if p.ndim == 1 or n in no_weight_decay_list:
+        # no decay: all 1D parameters (batch/layer norm and bias)
+        # and model specific ones
+        if (exclude_1d_params and param.ndim == 1) or name in no_weight_decay_list:
             g_decay = "no_decay"
             this_decay = 0.
         else:
             g_decay = "decay"
             this_decay = weight_decay
-            
-        layer_id = get_layer_id_for_vit(n, num_layers)
-        group_name = "layer_%d_%s" % (layer_id, g_decay)
+
+        layer_id = get_layer_id_for_vit(name, num_layers)
+        group_name = f"layer_{layer_id}_{g_decay}"
 
         if group_name not in param_group_names:
             this_scale = layer_scales[layer_id]
@@ -53,10 +49,8 @@ def param_groups_lrd(model, weight_decay=0.05, no_weight_decay_list=[], layer_de
                 "params": [],
             }
 
-        param_group_names[group_name]["params"].append(n)
-        param_groups[group_name]["params"].append(p)
-
-    # print("parameter groups: \n%s" % json.dumps(param_group_names, indent=2))
+        param_group_names[group_name]["params"].append(name)
+        param_groups[group_name]["params"].append(param)
 
     return list(param_groups.values())
 
@@ -66,9 +60,7 @@ def get_layer_id_for_vit(name, num_layers):
     Assign a parameter with its layer id
     Following BEiT: https://github.com/microsoft/unilm/blob/master/beit/optim_factory.py#L33
     """
-    if name in ['cls_token', 'pos_embed']:
-        return 0
-    elif name.startswith('patch_embed'):
+    if name in {'cls_token', 'pos_embed'} or name.startswith('patch_embed'):
         return 0
     elif name.startswith('blocks'):
         return int(name.split('.')[1]) + 1

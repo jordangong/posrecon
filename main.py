@@ -12,6 +12,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 
 from models import MaskedPosReconCLRViT
+from utils.lr_decay import param_groups_lrd
 
 
 class PosReconCLR(LightningModule):
@@ -43,6 +44,7 @@ class PosReconCLR(LightningModule):
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
             weight_decay: float = 1e-6,
+            layer_decay: float = 1.,
             **kwargs
     ):
         super(PosReconCLR, self).__init__()
@@ -68,6 +70,7 @@ class PosReconCLR(LightningModule):
         self.optim = optimizer
         self.exclude_bn_bias = exclude_bn_bias
         self.weight_decay = weight_decay
+        self.layer_decay = layer_decay
         self.position = position
         self.shuffle = shuffle
         self.mask_ratio = mask_ratio
@@ -128,45 +131,19 @@ class PosReconCLR(LightningModule):
         }, sync_dist=True)
         return loss
 
-    @staticmethod
-    def exclude_from_wt_decay(named_params, weight_decay, skip_list=("bias", "bn")):
-        params = []
-        excluded_params = []
-
-        for name, param in named_params:
-            if not param.requires_grad:
-                continue
-            elif any(layer_name in name for layer_name in skip_list):
-                excluded_params.append(param)
-            else:
-                params.append(param)
-
-        return [
-            {"params": params, "weight_decay": weight_decay},
-            {
-                "params": excluded_params,
-                "weight_decay": 0.0,
-            },
-        ]
-
     def configure_optimizers(self):
-        if self.exclude_bn_bias:
-            params = self.exclude_from_wt_decay(self.named_parameters(),
-                                                weight_decay=self.weight_decay)
-        else:
-            params = self.parameters()
+        param_groups = param_groups_lrd(
+            self.model,
+            weight_decay=self.weight_decay,
+            exclude_1d_params=self.exclude_bn_bias,
+            no_weight_decay_list=("pos_embed", "cls_token"),
+            layer_decay=self.layer_decay
+        )
 
         if self.optim == "lars":
-            optimizer = LARS(
-                params,
-                lr=self.learning_rate,
-                momentum=0.9,
-                weight_decay=self.weight_decay,
-                trust_coefficient=0.001,
-            )
+            optimizer = LARS(param_groups, lr=self.learning_rate, momentum=0.9)
         elif self.optim == "adam":
-            optimizer = torch.optim.Adam(params, lr=self.learning_rate,
-                                         weight_decay=self.weight_decay)
+            optimizer = torch.optim.Adam(param_groups, lr=self.learning_rate)
 
         warmup_steps = self.train_iters_per_epoch * self.warmup_epochs
         total_steps = self.train_iters_per_epoch * self.max_epochs
@@ -234,7 +211,7 @@ class PosReconCLR(LightningModule):
                             help="choose between adam/lars")
         parser.add_argument("--exclude_bn_bias", default=True,
                             action=BooleanOptionalAction,
-                            help="exclude bn/bias from weight decay")
+                            help="exclude bn/ln/bias from weight decay")
         parser.add_argument("--max_epochs", default=100, type=int,
                             help="number of total epochs to run")
         parser.add_argument("--max_steps", default=-1, type=int,
@@ -256,6 +233,8 @@ class PosReconCLR(LightningModule):
                             help="weight of two losses")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
                             help="weight decay")
+        parser.add_argument("--layer_decay", default=1., type=float,
+                            help="layer-wise decay")
         parser.add_argument("--learning_rate", default=1e-3, type=float,
                             help="base learning rate")
 

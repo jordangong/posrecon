@@ -16,6 +16,7 @@ from torch import nn
 from main import PosReconCLR
 from models import MaskedPosReconCLRViT
 from utils.datamodules import FewShotImagenetDataModule
+from utils.lr_decay import param_groups_lrd
 
 
 class PosReconCLREval(SSLFineTuner):
@@ -24,6 +25,8 @@ class PosReconCLREval(SSLFineTuner):
         protocol: str = 'linear',
         label_smoothing: float = 0.,
         optim: str = 'sgd',
+        exclude_bn_bias: bool = True,
+        layer_decay: float = 0.,
         warmup_epochs: int = 10,
         start_lr: float = 0.,
         **kwargs
@@ -43,6 +46,8 @@ class PosReconCLREval(SSLFineTuner):
         self.protocol = protocol
         self.label_smoothing = label_smoothing
         self.optim = optim
+        self.exclude_bn_bias = exclude_bn_bias
+        self.layer_decay = layer_decay
         self.warmup_epochs = warmup_epochs
         self.start_lr = start_lr
 
@@ -109,22 +114,41 @@ class PosReconCLREval(SSLFineTuner):
         return loss
 
     def configure_optimizers(self):
-        if self.protocol == "linear":
-            params = self.linear_layer.parameters()
-        elif self.protocol == "finetune":
-            params = self.parameters()
+        param_groups = []
+        # add backbone to params_groups while finetuning
+        if self.protocol == "finetune":
+            param_groups += param_groups_lrd(
+                self.backbone,
+                weight_decay=self.weight_decay,
+                exclude_1d_params=self.exclude_bn_bias,
+                no_weight_decay_list=("pos_embed", "cls_token"),
+                layer_decay=self.layer_decay
+            )
+        # add linear head
+        if self.exclude_bn_bias:
+            linear_include_params, linear_exclude_params = [], []
+            for param in self.linear_layer.parameters():
+                if param.ndim == 1:
+                    linear_exclude_params.append(param)
+                else:
+                    linear_include_params.append(param)
+            linear_param_groups = [
+                {"params": linear_exclude_params, "weight_decay": 0.},
+                {"params": linear_include_params, "weight_decay": self.weight_decay}
+            ]
+        else:
+            linear_param_groups = self.linear_layer.parameters()
+        param_groups += linear_param_groups
 
         if self.optim == "sdg":
             optimizer = torch.optim.SGD(
-                params,
+                param_groups,
                 lr=self.learning_rate,
                 nesterov=self.nesterov,
                 momentum=0.9,
-                weight_decay=self.weight_decay,
             )
         elif self.optim == "adam":
-            optimizer = torch.optim.Adam(params, lr=self.learning_rate,
-                                         weight_decay=self.weight_decay)
+            optimizer = torch.optim.Adam(param_groups, lr=self.learning_rate)
 
         # set scheduler
         if self.scheduler_type == "step":
@@ -184,8 +208,10 @@ class PosReconCLREval(SSLFineTuner):
         parser.add_argument("--path_dropout", type=float, default=0.0)
         parser.add_argument("--head_dropout", type=float, default=0.0)
         parser.add_argument("--optimizer", type=str, default="sgd")
+        parser.add_argument("--exclude_bn_bias", default=True, action=BooleanOptionalAction)
         parser.add_argument("--learning_rate", type=float, default=0.1)
         parser.add_argument("--weight_decay", type=float, default=1e-6)
+        parser.add_argument("--layer_decay", type=float, default=1.)
         parser.add_argument("--label_smoothing", type=float, default=0.0)
         parser.add_argument("--nesterov", type=bool, default=False)
         parser.add_argument("--scheduler_type", type=str, default="warmup-anneal")
@@ -262,8 +288,10 @@ if __name__ == "__main__":
         epochs=args.max_epochs,
         dropout=args.head_dropout,
         optim=args.optimizer,
+        exclude_bn_bias=args.exclude_bn_bias,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        layer_decay=args.layer_decay,
         label_smoothing=args.label_smoothing,
         nesterov=args.nesterov,
         scheduler_type=args.scheduler_type,
