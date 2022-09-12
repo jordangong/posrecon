@@ -137,7 +137,9 @@ class PosReconCLREval(SSLFineTuner):
                 {"params": linear_include_params, "weight_decay": self.weight_decay}
             ]
         else:
-            linear_param_groups = self.linear_layer.parameters()
+            linear_param_groups = [
+                {"params": self.linear_layer.parameters(), "weight_decay": self.weight_decay}
+            ]
         param_groups += linear_param_groups
 
         if self.optim == "sdg":
