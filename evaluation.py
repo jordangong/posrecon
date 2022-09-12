@@ -2,7 +2,6 @@ from argparse import ArgumentParser, BooleanOptionalAction
 from functools import partial
 
 import torch
-import torch.nn.functional as F
 from pl_bolts.datamodules import ImagenetDataModule
 from pl_bolts.models.self_supervised import SSLFineTuner
 from pl_bolts.models.self_supervised.simclr.transforms import SimCLRFinetuneTransform
@@ -11,6 +10,8 @@ from pl_bolts.transforms.dataset_normalizations import imagenet_normalization
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
+from timm.data.mixup import Mixup
+from timm.loss.cross_entropy import SoftTargetCrossEntropy
 from torch import nn
 
 from main import PosReconCLR
@@ -23,10 +24,12 @@ class PosReconCLREval(SSLFineTuner):
     def __init__(
         self,
         protocol: str = 'linear',
-        label_smoothing: float = 0.,
         optim: str = 'sgd',
         exclude_bn_bias: bool = True,
-        layer_decay: float = 0.,
+        layer_decay: float = 1.,
+        mixup_alpha: float = 0.,
+        cutmix_alpha: float = 0.,
+        label_smoothing: float = 0.,
         warmup_epochs: int = 10,
         start_lr: float = 0.,
         **kwargs
@@ -34,8 +37,14 @@ class PosReconCLREval(SSLFineTuner):
         """
         Args:
             protocol: evaluation protocol, including `linear` and `finetune`
-            label_smoothing: label smoothing regularization
             optim: optimizer (SGD or Adam)
+            exclude_bn_bias: exclude weight decay on 1d params (e.g. bn/ln and bias)
+            mixup_alpha: mixup alpha, active if > 0.
+            cutmix_alpha: cutmix alpha, active if > 0.
+            label_smoothing: label smoothing regularization
+            layer_decay: layer-wise learning rate decay
+            warmup_epochs: linear warmup epochs
+            start_lr: start learning rate
         """
         assert protocol in {'linear', 'finetune'}, f"unknown protocol: {protocol}"
         assert optim in {'sgd', 'adam'}, f"unknown optimizer: {optim}"
@@ -44,12 +53,22 @@ class PosReconCLREval(SSLFineTuner):
         self.save_hyperparameters(ignore=['backbone'])
 
         self.protocol = protocol
+        self.mixup = None
+        if mixup_alpha > 0. or cutmix_alpha > 0.:
+            self.mixup = Mixup(mixup_alpha, cutmix_alpha,
+                               label_smoothing=label_smoothing,
+                               num_classes=self.linear_layer.n_classes)
         self.label_smoothing = label_smoothing
         self.optim = optim
         self.exclude_bn_bias = exclude_bn_bias
         self.layer_decay = layer_decay
         self.warmup_epochs = warmup_epochs
         self.start_lr = start_lr
+
+        if self.mixup is None:
+            self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        else:
+            self.criterion = SoftTargetCrossEntropy()
 
     def on_train_epoch_start(self) -> None:
         if self.protocol == 'linear':
@@ -71,6 +90,9 @@ class PosReconCLREval(SSLFineTuner):
 
     def shared_step(self, batch):
         x, y = batch
+        target = y.clone()  # get a copy of non-mixup labels
+        if self.mixup is not None:
+            x, y = self.mixup(x, y)
 
         if self.protocol == 'linear':
             with torch.no_grad():
@@ -79,13 +101,13 @@ class PosReconCLREval(SSLFineTuner):
             feats = self.forward_backbone(x)
 
         logits = self.linear_layer(feats)
-        loss = F.cross_entropy(logits, y, label_smoothing=self.label_smoothing)
+        loss = self.criterion(logits, y)
 
-        return loss, logits, y
+        return loss, logits, target
 
     def training_step(self, batch, batch_idx):
-        loss, logits, y = self.shared_step(batch)
-        acc = self.train_acc(logits.softmax(-1), y)
+        loss, logits, target = self.shared_step(batch)
+        acc = self.train_acc(logits.softmax(-1), target)
 
         self.log(f"loss/xent_{self.protocol}/train", loss, prog_bar=True)
         self.log(f"acc/{self.protocol}/train_step", acc, prog_bar=True)
@@ -95,8 +117,8 @@ class PosReconCLREval(SSLFineTuner):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, logits, y = self.shared_step(batch)
-        self.val_acc(logits.softmax(-1), y)
+        loss, logits, target = self.shared_step(batch)
+        self.val_acc(logits.softmax(-1), target)
 
         self.log(f"loss/xent_{self.protocol}/val",
                  loss, prog_bar=True, sync_dist=True)
@@ -105,8 +127,8 @@ class PosReconCLREval(SSLFineTuner):
         return loss
 
     def test_step(self, batch, batch_idx):
-        loss, logits, y = self.shared_step(batch)
-        self.test_acc(logits.softmax(-1), y)
+        loss, logits, target = self.shared_step(batch)
+        self.test_acc(logits.softmax(-1), target)
 
         self.log(f"loss/xent_{self.protocol}/test", loss, sync_dist=True)
         self.log(f"acc/{self.protocol}/test_epoch", self.test_acc)
@@ -213,7 +235,9 @@ class PosReconCLREval(SSLFineTuner):
         parser.add_argument("--exclude_bn_bias", default=True, action=BooleanOptionalAction)
         parser.add_argument("--learning_rate", type=float, default=0.1)
         parser.add_argument("--weight_decay", type=float, default=1e-6)
-        parser.add_argument("--layer_decay", type=float, default=1.)
+        parser.add_argument("--layer_decay", type=float, default=1.0)
+        parser.add_argument("--mixup_alpha", type=float, default=0.0)
+        parser.add_argument("--cutmix_alpha", type=float, default=0.0)
         parser.add_argument("--label_smoothing", type=float, default=0.0)
         parser.add_argument("--nesterov", type=bool, default=False)
         parser.add_argument("--scheduler_type", type=str, default="warmup-anneal")
@@ -294,6 +318,8 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         layer_decay=args.layer_decay,
+        mixup_alpha=args.mixup_alpha,
+        cutmix_alpha=args.cutmix_alpha,
         label_smoothing=args.label_smoothing,
         nesterov=args.nesterov,
         scheduler_type=args.scheduler_type,
