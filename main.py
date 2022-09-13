@@ -9,11 +9,12 @@ from pl_bolts.transforms.dataset_normalizations import imagenet_normalization
 from pytorch_lightning import Trainer, LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.plugins import DDP2Plugin, DDPPlugin
 from torch import nn
 
 from models import MaskedPosReconCLRViT
 from utils.lr_decay import param_groups_lrd
-
+from utils.dist import concat_all_gather
 
 class PosReconCLR(LightningModule):
     def __init__(
@@ -21,6 +22,7 @@ class PosReconCLR(LightningModule):
             gpus: int,
             num_samples: int,
             batch_size: int,
+            mem_bank_size: int = 0,
             num_nodes: int = 1,
             img_size: int = 224,
             patch_size: int = 16,
@@ -54,6 +56,7 @@ class PosReconCLR(LightningModule):
         self.num_nodes = num_nodes
         self.num_samples = num_samples
         self.batch_size = batch_size
+        self.mem_bank_size = mem_bank_size
 
         self.img_size = img_size
         self.patch_size = patch_size
@@ -97,17 +100,53 @@ class PosReconCLR(LightningModule):
         )
 
         # compute iters per epoch
-        global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
-        self.train_iters_per_epoch = num_samples // global_batch_size
+        self.global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
+        self.train_iters_per_epoch = num_samples // self.global_batch_size
 
-    def shared_step(self, batch):
+        # queue as a memory bank (referred from MoCo)
+        if mem_bank_size > 0:
+            assert mem_bank_size % self.global_batch_size == 0  # for simplicity
+
+            self.register_buffer("queue", torch.randn(mem_bank_size, proj_dim))
+            self.queue = nn.functional.normalize(self.queue)
+            self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+            self.register_buffer("val_queue", torch.randn(mem_bank_size, proj_dim))
+            self.val_queue = nn.functional.normalize(self.val_queue)
+            self.register_buffer("val_queue_ptr", torch.zeros(1, dtype=torch.long))
+
+
+    def shared_step(self, batch, mem_bank=None):
         (img1, img2, _), _ = batch
         img = torch.cat((img1, img2))
-        return self.model(img, self.position, self.shuffle,
+        return self.model(img, mem_bank, self.position, self.shuffle,
                           self.mask_ratio, self.temperature)
 
+    @staticmethod
+    def _use_ddp_or_ddp2(trainer: Trainer) -> bool:
+        return isinstance(trainer.training_type_plugin, (DDPPlugin, DDP2Plugin))
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, queue, queue_ptr, feat):
+        _, pos_feat = feat.chunk(2)
+        # gather pos_feat before updating queue
+        if self._use_ddp_or_ddp2(self.trainer):
+            pos_feat = concat_all_gather(pos_feat)
+
+        ptr = queue_ptr.item()
+
+        # replace the keys at ptr (dequeue and enqueue)
+        queue[ptr:ptr + self.global_batch_size] = pos_feat
+        ptr = (ptr + self.global_batch_size) % self.mem_bank_size  # move pointer
+
+        queue_ptr[0] = ptr
+
     def training_step(self, batch, batch_idx):
-        latent, pos_embed_pred, proj_embed, loss_recon, loss_clr = self.shared_step(batch)
+        mem_bank = self.queue.clone().detach() if self.mem_bank_size > 0 else None
+        (latent, pos_embed_pred, proj_embed,
+         loss_recon, loss_clr) = self.shared_step(batch, mem_bank)
+        self._dequeue_and_enqueue(self.queue, self.queue_ptr, proj_embed)
+
         loss = self.loss_ratio * loss_recon + loss_clr
 
         self.log_dict({
@@ -121,7 +160,10 @@ class PosReconCLR(LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        *_, loss_recon, loss_clr = self.shared_step(batch)
+        mem_bank = self.val_queue.clone().detach() if self.mem_bank_size > 0 else None
+        *_, proj_embed, loss_recon, loss_clr = self.shared_step(batch, mem_bank)
+        self._dequeue_and_enqueue(self.val_queue, self.val_queue_ptr, proj_embed)
+
         loss = self.loss_ratio * loss_recon + loss_clr
 
         self.log_dict({
@@ -220,6 +262,8 @@ class PosReconCLR(LightningModule):
                             help="number of warmup epochs")
         parser.add_argument("--batch_size", default=128, type=int,
                             help="batch size per gpu")
+        parser.add_argument("--mem_bank_size", default=0, type=int,
+                            help="memory bank for negative samples")
 
         parser.add_argument("--position", default=True, action=BooleanOptionalAction,
                             help="add positional embedding or not")
@@ -249,9 +293,12 @@ if __name__ == '__main__':
 
     if args.dataset == "imagenet":
         normalization = imagenet_normalization()
-        dm = ImagenetDataModule(data_dir=args.data_dir,
-                                batch_size=args.batch_size,
-                                num_workers=args.num_workers)
+        dm = ImagenetDataModule(
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            drop_last=True if args.mem_bank_size > 0 else False,
+        )
         args.num_samples = dm.num_samples
         args.input_height = dm.dims[-1]
     else:

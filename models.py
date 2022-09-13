@@ -5,32 +5,8 @@ import torch.nn.functional as F
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch import nn
 
+from utils.dist import SyncFunction
 from utils.pos_embed import get_2d_sincos_pos_embed
-
-
-class SyncFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, tensor):
-        ctx.batch_size = tensor.shape[0]
-
-        gathered_tensor = [torch.zeros_like(tensor)
-                           for _ in range(torch.distributed.get_world_size())]
-
-        torch.distributed.all_gather(gathered_tensor, tensor)
-        gathered_tensor = torch.cat(gathered_tensor, 0)
-
-        return gathered_tensor
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        grad_input = grad_output.clone()
-        torch.distributed.all_reduce(grad_input,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     async_op=False)
-
-        idx_from = torch.distributed.get_rank() * ctx.batch_size
-        idx_to = (torch.distributed.get_rank() + 1) * ctx.batch_size
-        return grad_input[idx_from:idx_to]
 
 
 class MaskedPosReconCLRViT(nn.Module):
@@ -211,11 +187,22 @@ class MaskedPosReconCLRViT(nn.Module):
         loss = F.mse_loss(batch_pos_embed_pred, batch_pos_embed_targ)
         return loss
 
-    @staticmethod
-    def info_nce_loss(features, temp, eps=1e-6):
-        feat = F.normalize(features)
+    def contrastive_loss(self, feature, mem_bank=None, temp=0.1):
+        feat = F.normalize(feature)
         # feat: [batch_size*2, proj_dim]
-        feat = torch.stack(feat.chunk(2), dim=1)
+        anch_feat, pos_feat = feat.chunk(2)
+        # {anch,pos}_feat: [batch_size, proj_dim]
+        if mem_bank:
+            loss_clr = self.bank_info_nce_loss(anch_feat, pos_feat, mem_bank, temp)
+        else:
+            feat = torch.stack((anch_feat, pos_feat), dim=1)
+            # feat: [batch_size, 2, proj_dim]
+            loss_clr = self.batch_info_nce_loss(feat, temp)
+
+        return loss_clr
+
+    @staticmethod
+    def batch_info_nce_loss(feat, temp, eps=1e-6):
         # feat: [batch_size, 2, proj_dim]
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             feat = SyncFunction.apply(feat)
@@ -243,12 +230,38 @@ class MaskedPosReconCLRViT(nn.Module):
 
         return loss
 
-    def forward_loss(self, batch_pos_embed_pred, vis_ids, features, temp=0.1):
+    @staticmethod
+    def bank_info_nce_loss(anch_feat, pos_feat, neg_feat, temp):
+        """
+        Referred from MoCo
+        Permlink: https://github.com/facebookresearch/moco/blob/78b69cafae80bc74cd1a89ac3fb365dc20d157d3/moco/builder.py#L141
+        """
+        
+        # compute logits
+        # Einstein sum is more intuitive
+        pos_logits = torch.einsum("nc,nc->n", [anch_feat, pos_feat]).unsqueeze(-1)
+        # pos_logits: [batch_size, 1]
+        neg_logits = torch.einsum("nc,ck->nk", [anch_feat, neg_feat.T])
+        # neg_logits: [batch_size, mem_bank_size]
+
+        logits = torch.cat([pos_logits, neg_logits], dim=1)
+        # logits: [batch_size, (1 + mem_bank_size)]
+        logits /= temp
+
+        # labels: positive key indicators
+        labels = torch.zeros(logits.size(0), dtype=torch.long)
+        loss = F.cross_entropy(logits, labels)
+
+        return loss
+
+    def forward_loss(self, batch_pos_embed_pred, vis_ids, features,
+                     mem_bank=None, temp=0.1):
         loss_recon = self.pos_recon_loss(batch_pos_embed_pred, vis_ids)
-        loss_clr = self.info_nce_loss(features, temp)
+        loss_clr = self.contrastive_loss(features, mem_bank, temp)
         return loss_recon, loss_clr
 
-    def forward(self, img, position=True, shuffle=True, mask_ratio=0.75, temp=0.01):
+    def forward(self, img, mem_bank=None,
+                position=True, shuffle=True, mask_ratio=0.75, temp=0.01):
         # img: [batch_size*2, in_chans, height, weight]
         latent, vis_ids = self.forward_encoder(img, position, shuffle, mask_ratio)
         # latent: [batch_size*2, 1 + seq_len * mask_ratio, embed_dim]
@@ -256,5 +269,5 @@ class MaskedPosReconCLRViT(nn.Module):
         # pos_pred: [batch_size*2, seq_len * mask_ratio, embed_dim]
         feat = self.proj_head(latent[:, 0, :])
         # reps: [batch_size*2, proj_dim]
-        loss_recon, loss_clr = self.forward_loss(pos_pred, vis_ids, feat, temp)
+        loss_recon, loss_clr = self.forward_loss(pos_pred, vis_ids, feat, mem_bank, temp)
         return latent, pos_pred, feat, loss_recon, loss_clr
