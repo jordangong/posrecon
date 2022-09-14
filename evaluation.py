@@ -141,6 +141,7 @@ class PosReconCLREval(SSLFineTuner):
         if self.protocol == "finetune":
             param_groups += param_groups_lrd(
                 self.backbone,
+                lr=self.learning_rate,
                 weight_decay=self.weight_decay,
                 exclude_1d_params=self.exclude_bn_bias,
                 no_weight_decay_list=("pos_embed", "cls_token"),

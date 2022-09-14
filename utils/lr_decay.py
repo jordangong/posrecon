@@ -5,7 +5,7 @@
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
 # MAE: https://github.com/facebookresearch/mae
 
-def param_groups_lrd(model, weight_decay=1e-6, exclude_1d_params=True,
+def param_groups_lrd(model, lr, weight_decay=1e-6, exclude_1d_params=True,
                      no_weight_decay_list=(), layer_decay=0.):
     """
     Parameter groups for layer-wise lr decay
@@ -39,12 +39,12 @@ def param_groups_lrd(model, weight_decay=1e-6, exclude_1d_params=True,
             this_scale = layer_scales[layer_id]
 
             param_group_names[group_name] = {
-                "lr_scale": this_scale,
+                "lr": lr * this_scale,
                 "weight_decay": this_decay,
                 "params": [],
             }
             param_groups[group_name] = {
-                "lr_scale": this_scale,
+                "lr": lr * this_scale,
                 "weight_decay": this_decay,
                 "params": [],
             }
