@@ -145,7 +145,8 @@ class PosReconCLR(LightningModule):
         mem_bank = self.queue.clone().detach() if self.mem_bank_size > 0 else None
         (latent, pos_embed_pred, proj_embed,
          loss_recon, loss_clr) = self.shared_step(batch, mem_bank)
-        self._dequeue_and_enqueue(self.queue, self.queue_ptr, proj_embed)
+        if mem_bank is not None:
+            self._dequeue_and_enqueue(self.queue, self.queue_ptr, proj_embed)
 
         loss = self.loss_ratio * loss_recon + loss_clr
 
@@ -162,7 +163,8 @@ class PosReconCLR(LightningModule):
     def validation_step(self, batch, batch_idx):
         mem_bank = self.val_queue.clone().detach() if self.mem_bank_size > 0 else None
         *_, proj_embed, loss_recon, loss_clr = self.shared_step(batch, mem_bank)
-        self._dequeue_and_enqueue(self.val_queue, self.val_queue_ptr, proj_embed)
+        if mem_bank is not None:
+            self._dequeue_and_enqueue(self.val_queue, self.val_queue_ptr, proj_embed)
 
         loss = self.loss_ratio * loss_recon + loss_clr
 
