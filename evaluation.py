@@ -252,6 +252,7 @@ class PosReconCLREval(SSLFineTuner):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--version", default=None, type=str)
+    parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser = PosReconCLREval.add_model_specific_args(parser)
     args = parser.parse_args()
 
@@ -352,5 +353,5 @@ if __name__ == "__main__":
         fast_dev_run=args.fast_dev_run,
     )
 
-    trainer.fit(evaluator, datamodule=dm)
+    trainer.fit(evaluator, datamodule=dm, ckpt_path=args.resume_ckpt_path)
     trainer.test(dataloaders=dm, ckpt_path='last')

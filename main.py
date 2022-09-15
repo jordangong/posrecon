@@ -243,10 +243,11 @@ class PosReconCLR(LightningModule):
 
 
 if __name__ == '__main__':
-    paser = ArgumentParser()
-    paser.add_argument("--version", default=None, type=str)
-    paser = PosReconCLR.add_model_specific_args(paser)
-    args = paser.parse_args()
+    parser = ArgumentParser()
+    parser.add_argument("--version", default=None, type=str)
+    parser.add_argument("--resume_ckpt_path", default=None, type=str)
+    parser = PosReconCLR.add_model_specific_args(parser)
+    args = parser.parse_args()
 
     if args.dataset == "imagenet":
         normalization = imagenet_normalization()
@@ -293,4 +294,4 @@ if __name__ == '__main__':
         fast_dev_run=args.fast_dev_run,
     )
 
-    trainer.fit(model, datamodule=dm)
+    trainer.fit(model, datamodule=dm, ckpt_path=args.resume_ckpt_path)
