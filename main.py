@@ -245,6 +245,7 @@ class PosReconCLR(LightningModule):
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--version", default=None, type=str)
+    parser.add_argument("--log_path", default="lightning_logs", type=str)
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser = PosReconCLR.add_model_specific_args(parser)
     args = parser.parse_args()
@@ -275,7 +276,7 @@ if __name__ == '__main__':
 
     model = PosReconCLR(**args.__dict__)
 
-    logger = TensorBoardLogger("lightning_logs", name="pretrain", version=args.version)
+    logger = TensorBoardLogger(args.log_path, name="pretrain", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")
     model_checkpoint = ModelCheckpoint(save_last=True, monitor="loss/pretrain/val")
     callbacks = [model_checkpoint, lr_monitor]

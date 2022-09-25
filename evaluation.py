@@ -252,6 +252,7 @@ class PosReconCLREval(SSLFineTuner):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--version", default=None, type=str)
+    parser.add_argument("--log_path", default="lightning_logs", type=str)
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser = PosReconCLREval.add_model_specific_args(parser)
     args = parser.parse_args()
@@ -331,7 +332,7 @@ if __name__ == "__main__":
         final_lr=args.final_lr,
     )
 
-    logger = TensorBoardLogger("lightning_logs", name="evaluation", version=args.version)
+    logger = TensorBoardLogger(args.log_path, name="evaluation", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")
     model_checkpoint = ModelCheckpoint(
         save_last=True,
