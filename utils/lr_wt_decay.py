@@ -66,3 +66,22 @@ def get_layer_id_for_vit(name, num_layers):
         return int(name.split('.')[1]) + 1
     else:
         return num_layers
+
+
+def exclude_from_wt_decay(model, weight_decay, skip_list=()):
+    params = []
+    excluded_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if param.dim == 1 or name in skip_list:
+            excluded_params.append(param)
+        else:
+            params.append(param)
+
+    return [
+        {"params": params, "weight_decay": weight_decay},
+        {"params": excluded_params, "weight_decay": 0.0},
+    ]

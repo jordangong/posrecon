@@ -11,8 +11,8 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 
-from models import MaskedPosReconCLRViT
-from utils.lr_decay import param_groups_lrd
+from models import MaskedPosReconCLRViT, SimCLRResNet
+from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 
 
 class PosReconCLR(LightningModule):
@@ -22,6 +22,8 @@ class PosReconCLR(LightningModule):
             num_samples: int,
             batch_size: int,
             num_nodes: int = 1,
+            backbone: str = "vit",
+            layers: tuple = (3, 4, 6, 3),
             img_size: int = 224,
             patch_size: int = 16,
             in_chans: int = 3,
@@ -54,7 +56,12 @@ class PosReconCLR(LightningModule):
         self.num_nodes = num_nodes
         self.num_samples = num_samples
         self.batch_size = batch_size
+        self.backbone = backbone
 
+        # ResNet params
+        self.layers = layers
+
+        # ViT params
         self.img_size = img_size
         self.patch_size = patch_size
         self.in_chans = in_chans
@@ -94,6 +101,11 @@ class PosReconCLR(LightningModule):
             attention_drop_rate,
             drop_path_rate,
             partial(nn.LayerNorm, eps=1e-6),
+        ) if backbone == "vit" else SimCLRResNet(
+            layers=layers,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+            proj_dim=proj_dim,
         )
 
         # compute iters per epoch
@@ -132,14 +144,26 @@ class PosReconCLR(LightningModule):
         return loss
 
     def configure_optimizers(self):
-        param_groups = param_groups_lrd(
-            self.model,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-            exclude_1d_params=self.exclude_bn_bias,
-            no_weight_decay_list=("pos_embed", "cls_token"),
-            layer_decay=self.layer_decay
-        )
+        if self.backbone == "vit":
+            param_groups = param_groups_lrd(
+                self.model,
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+                exclude_1d_params=self.exclude_bn_bias,
+                no_weight_decay_list=("pos_embed", "cls_token"),
+                layer_decay=self.layer_decay
+            )
+        else:
+            if self.exclude_bn_bias:
+                param_groups = exclude_from_wt_decay(
+                    self.model,
+                    self.weight_decay
+                )
+            else:
+                param_groups = {
+                    "params": self.model.parameters(),
+                    "weight_decay": self.weight_decay
+                }
 
         if self.optim == "lars":
             optimizer = LARS(param_groups, lr=self.learning_rate, momentum=0.9)
@@ -165,6 +189,10 @@ class PosReconCLR(LightningModule):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
 
         # model params
+        parser.add_argument("--backbone", default="vit", type=str,
+                            help="backbone (ViT or ResNet)")
+        parser.add_argument("--layers", default=(3, 4, 6, 3), nargs=4, type=int,
+                            help="number of ResNet layers in each block")
         parser.add_argument("--img_size", default=224, type=int,
                             help="input image size")
         parser.add_argument("--patch_size", default=16, type=int,
