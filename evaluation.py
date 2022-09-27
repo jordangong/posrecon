@@ -77,7 +77,7 @@ class PosReconCLREval(SSLFineTuner):
             self.backbone.train()
 
     def forward_resnet(self, x):
-        return self.backbone.encoder(x)
+        return self.backbone.encoder(x)[0]
 
     def forward_vit(self, x):
         x = self.backbone.patch_embed(x)

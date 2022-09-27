@@ -103,7 +103,6 @@ class PosReconCLR(LightningModule):
             partial(nn.LayerNorm, eps=1e-6),
         ) if backbone == "vit" else SimCLRResNet(
             layers=layers,
-            in_chans=in_chans,
             embed_dim=embed_dim,
             proj_dim=proj_dim,
         )

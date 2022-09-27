@@ -2,7 +2,7 @@ from typing import Callable
 
 import torch
 import torch.nn.functional as F
-from timm.models.resnet import Bottleneck, ResNet
+from pl_bolts.models.self_supervised.resnets import Bottleneck, ResNet
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch import nn
 
@@ -40,14 +40,13 @@ class SimCLRResNet(nn.Module):
             self,
             block: Callable = Bottleneck,
             layers: tuple = (3, 4, 6, 3),
-            in_chans: int = 3,
             embed_dim: int = 2048,
             proj_dim: int = 128,
     ):
         super(SimCLRResNet, self).__init__()
 
         # Encoder
-        self.encoder = ResNet(block, layers, embed_dim, in_chans)
+        self.encoder = ResNet(block, layers)
 
         # Projection head
         self.proj_head = nn.Sequential(
@@ -59,7 +58,7 @@ class SimCLRResNet(nn.Module):
 
     def forward(self, img, position=True, shuffle=True, mask_ratio=0.75, temp=0.01):
         # img: [batch_size*2, in_chans, height, weight]
-        embed = self.encoder(img)
+        embed = self.encoder(img)[0]
         # embed: [batch_size*2, embed_dim]
         feat = self.proj_head(embed)
         # reps: [batch_size*2, proj_dim]
