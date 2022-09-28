@@ -278,21 +278,6 @@ if __name__ == "__main__":
     parser = PosReconCLREval.add_model_specific_args(parser)
     args = parser.parse_args()
 
-    if args.dataset == "imagenet":
-        if args.label_pct < 100:
-            dm = FewShotImagenetDataModule(args.label_pct,
-                                           data_dir=args.data_dir,
-                                           batch_size=args.batch_size,
-                                           num_workers=args.num_workers)
-        else:
-            dm = ImagenetDataModule(data_dir=args.data_dir,
-                                    batch_size=args.batch_size,
-                                    num_workers=args.num_workers)
-    else:
-        raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
-
-    dm.train_transforms = dm.val_transforms = dm.test_transforms = transforms.ToTensor()
-
     pretrained = PosReconCLR.load_from_checkpoint(args.ckpt_path, strict=False)
     pretained_state_dict = pretrained.state_dict()
     # a bit hacky here, replace backbone with dropout rate
@@ -311,6 +296,29 @@ if __name__ == "__main__":
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
     )
     pretrained.load_state_dict(pretained_state_dict)
+
+    if args.dataset == "imagenet":
+        if args.label_pct < 100:
+            dm = FewShotImagenetDataModule(args.label_pct,
+                                           data_dir=args.data_dir,
+                                           batch_size=args.batch_size,
+                                           num_workers=args.num_workers)
+        else:
+            dm = ImagenetDataModule(data_dir=args.data_dir,
+                                    batch_size=args.batch_size,
+                                    num_workers=args.num_workers)
+    else:
+        raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
+
+    dm.train_transforms = transforms.Compose([
+        transforms.RandomResizedCrop(pretrained.img_size),
+        transforms.ToTensor(),
+    ])
+    dm.val_transforms = dm.test_transforms = transforms.Compose([
+        transforms.Resize(int(pretrained.img_size + 0.1 * pretrained.img_size)),
+        transforms.CenterCrop(pretrained.img_size),
+        transforms.ToTensor(),
+    ])
 
     evaluator = PosReconCLREval(
         protocol=args.protocol,

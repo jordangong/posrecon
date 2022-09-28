@@ -274,7 +274,10 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
 
-    dm.train_transforms = dm.val_transforms = transforms.ToTensor()
+    dm.train_transforms = dm.val_transforms = transforms.Compose([
+        transforms.RandomResizedCrop(args.img_size),
+        transforms.ToTensor(),
+    ])
 
     model = PosReconCLR(**args.__dict__)
 

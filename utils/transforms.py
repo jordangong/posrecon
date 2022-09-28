@@ -76,7 +76,6 @@ class SimCLRPretrainTransform(nn.Module):
         self.normalize = normalize
 
         data_transforms = [
-            K.RandomResizedCrop((self.img_size, self.img_size)),
             K.RandomHorizontalFlip(p=0.5),
             K.ColorJitter(
                 brightness=0.8 * self.jitter_strength,
@@ -124,9 +123,9 @@ class SimCLRFinetuneTransform(nn.Module):
         self.img_size = img_size
         self.normalize = normalize
 
+        data_transforms = []
         if not eval_transform:
-            data_transforms = [
-                K.RandomResizedCrop((self.img_size, self.img_size)),
+            data_transforms += [
                 K.RandomHorizontalFlip(p=0.5),
                 K.ColorJitter(
                     brightness=0.8 * self.jitter_strength,
@@ -136,11 +135,6 @@ class SimCLRFinetuneTransform(nn.Module):
                     p=0.8,
                 ),
                 K.RandomGrayscale(p=0.2),
-            ]
-        else:
-            data_transforms = [
-                K.Resize(int(self.img_size + 0.1 * self.img_size)),
-                K.CenterCrop(self.img_size),
             ]
 
         if normalize is None:
