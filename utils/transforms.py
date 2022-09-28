@@ -35,13 +35,14 @@ class RandomSigmaGaussianBlur(K.IntensityAugmentationBase2D):
             p_batch=1.0,
             keepdim=keepdim,
         )
+        self.register_buffer("sigma_min", torch.tensor(sigma_min))
+        self.register_buffer("sigma_max", torch.tensor(sigma_max))
         self.flags = dict(
             kernel_size=kernel_size,
             sigma_min=sigma_min,
             sigma_max=sigma_max,
             border_type=BorderType.get(border_type),
         )
-        self.sigma_dist = torch.distributions.Uniform(sigma_min, sigma_max)
 
     @staticmethod
     def batch_gaussian(window_size: int, sigma: Tensor) -> Tensor:
@@ -80,7 +81,8 @@ class RandomSigmaGaussianBlur(K.IntensityAugmentationBase2D):
             flags: Dict[str, Any],
             transform: Optional[Tensor] = None
     ) -> Tensor:
-        sigma = self.sigma_dist.sample((input.size(0),))
+        sigma_dist = torch.distributions.Uniform(self.sigma_min, self.sigma_max)
+        sigma = sigma_dist.sample((input.size(0),))
         return self.batch_gaussian_blur2d(
             input,
             kernel_size=(flags["kernel_size"], flags["kernel_size"]),
