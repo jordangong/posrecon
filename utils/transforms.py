@@ -148,5 +148,6 @@ class SimCLRFinetuneTransform(nn.Module):
         else:
             self.transform = K.AugmentationSequential(*data_transforms, normalize)
 
+    @torch.no_grad()
     def forward(self, x: Tensor) -> Tensor:
         return self.transform(x)
