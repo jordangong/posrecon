@@ -45,8 +45,10 @@ class MaskedPosReconCLRViT(nn.Module):
             patch_size: int = 16,
             in_chans: int = 3,
             embed_dim: int = 768,
-            depth: int = 12,
-            num_heads: int = 12,
+            encoder_depth: int = 12,
+            encoder_num_heads: int = 12,
+            decoder_depth: int = 3,
+            decoder_num_heads: int = 12,
             mlp_ratio: int = 4,
             proj_dim: int = 128,
             drop_rate: float = 0.,
@@ -60,8 +62,11 @@ class MaskedPosReconCLRViT(nn.Module):
             patch_size: patch size
             in_chans: number of in channels
             embed_dim: embedding dimension
-            depth: number of Transformer blocks
-            num_heads: number of self-attention heads
+            encoder_depth: encoder number of Transformer blocks
+            encoder_num_heads: encoder number of self-attention heads
+            decoder_depth: decoder number of Transformer blocks
+                           (set to 0 for linear layer)
+            decoder_num_heads: decoder number of self-attention heads
             mlp_ratio: MLP dimension ratio (mlp_dim = embed_dim * mlp_ratio)
             proj_dim: projection head output dimension
             drop_rate: dropout rate
@@ -81,15 +86,22 @@ class MaskedPosReconCLRViT(nn.Module):
                                       requires_grad=False)
 
         self.blocks = nn.Sequential(*[Block(
-            embed_dim, num_heads, mlp_ratio, qkv_bias=True,
+            embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True,
             drop=drop_rate, attn_drop=attention_drop_rate, drop_path=dpr.item(),
             norm_layer=norm_layer
-        ) for dpr in torch.linspace(0, drop_path_rate, depth)
+        ) for dpr in torch.linspace(0, drop_path_rate, encoder_depth)
         ])
         self.norm = norm_layer(embed_dim)
 
         # Position predictor (linear layer equiv.)
-        self.pos_decoder = nn.Conv1d(embed_dim, embed_dim, kernel_size=1)
+        if decoder_depth == 0:
+            self.pos_decoder = nn.Conv1d(embed_dim, embed_dim, kernel_size=1)
+        else:
+            self.pos_decoder = nn.Sequential(*[Block(
+                embed_dim, decoder_num_heads, mlp_ratio,
+                qkv_bias=True, norm_layer=norm_layer
+            ) for _ in range(decoder_depth)
+            ])
 
         # Projection head
         self.proj_head = nn.Sequential(
@@ -109,9 +121,11 @@ class MaskedPosReconCLRViT(nn.Module):
 
         # Init weights in convolutional layers like in MLPs
         patch_conv_weight = self.patch_embed.proj.weight.data
-        pos_conv_weight = self.pos_decoder.weight.data
         nn.init.xavier_uniform_(patch_conv_weight.view(patch_conv_weight.size(0), -1))
-        nn.init.xavier_uniform_(pos_conv_weight.view(pos_conv_weight.size(0), -1))
+
+        if isinstance(self.pos_decoder, nn.Conv1d):
+            pos_conv_weight = self.pos_decoder.weight.data
+            nn.init.xavier_uniform_(pos_conv_weight.view(pos_conv_weight.size(0), -1))
 
         nn.init.normal_(self.cls_token, std=.02)
 
@@ -186,11 +200,14 @@ class MaskedPosReconCLRViT(nn.Module):
         return x, visible_indices
 
     def forward_pos_decoder(self, latent):
-        # Exchange channel and length dimension for Conv1d
-        latent = latent.permute(0, 2, 1)
-        pos_embed_pred = self.pos_decoder(latent)
-        # Restore dimension
-        pos_embed_pred = pos_embed_pred.permute(0, 2, 1)
+        if isinstance(self.pos_decoder, nn.Conv1d):
+            # Exchange channel and length dimension for Conv1d
+            latent = latent.permute(0, 2, 1)
+            pos_embed_pred = self.pos_decoder(latent)
+            # Restore dimension
+            pos_embed_pred = pos_embed_pred.permute(0, 2, 1)
+        else:  # Transformer decoder
+            pos_embed_pred = self.pos_decoder(latent)
 
         return pos_embed_pred
 

@@ -26,8 +26,10 @@ class PosReconCLR(LightningModule):
             patch_size: int = 16,
             in_chans: int = 3,
             embed_dim: int = 768,
-            depth: int = 12,
-            num_heads: int = 12,
+            encoder_depth: int = 12,
+            encoder_num_heads: int = 12,
+            decoder_depth: int = 3,
+            decoder_num_heads: int = 12,
             mlp_ratio: int = 4,
             proj_dim: int = 128,
             drop_rate: float = 0.,
@@ -59,8 +61,10 @@ class PosReconCLR(LightningModule):
         self.patch_size = patch_size
         self.in_chans = in_chans
         self.embed_dim = embed_dim
-        self.depth = depth
-        self.num_heads = num_heads
+        self.encoder_depth = encoder_depth
+        self.encoder_num_heads = encoder_num_heads
+        self.decoder_depth = decoder_depth
+        self.decoder_num_heads = decoder_num_heads
         self.mlp_ratio = mlp_ratio
         self.proj_dim = proj_dim
         self.drop_rate = drop_rate
@@ -86,8 +90,10 @@ class PosReconCLR(LightningModule):
             patch_size,
             in_chans,
             embed_dim,
-            depth,
-            num_heads,
+            encoder_depth,
+            encoder_num_heads,
+            decoder_depth,
+            decoder_num_heads,
             mlp_ratio,
             proj_dim,
             drop_rate,
@@ -173,10 +179,14 @@ class PosReconCLR(LightningModule):
                             help="number of in channels")
         parser.add_argument("--embed_dim", default=768, type=int,
                             help="embedding dimension")
-        parser.add_argument("--depth", default=12, type=int,
-                            help="number of Transformer blocks")
-        parser.add_argument("--num_heads", default=12, type=int,
-                            help="number of self-attention heads")
+        parser.add_argument("--encoder_depth", default=12, type=int,
+                            help="encoder number of Transformer blocks")
+        parser.add_argument("--encoder_num_heads", default=12, type=int,
+                            help="encoder number of self-attention heads")
+        parser.add_argument("--decoder_depth", default=3, type=int,
+                            help="decoder number of Transformer blocks")
+        parser.add_argument("--decoder_num_heads", default=12, type=int,
+                            help="decoder number of self-attention heads")
         parser.add_argument("--mlp_ratio", default=4, type=int,
                             help="Ratio of embedding dim to MLP dim")
         parser.add_argument("--proj_dim", default=128, type=int,
