@@ -3,16 +3,16 @@ from functools import partial
 
 import torch
 from pl_bolts.datamodules import ImagenetDataModule
-from pl_bolts.models.self_supervised.simclr import SimCLRTrainDataTransform, SimCLREvalDataTransform
 from pl_bolts.optimizers import linear_warmup_decay, LARS
-from pl_bolts.transforms.dataset_normalizations import imagenet_normalization
 from pytorch_lightning import Trainer, LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
+from torchvision import transforms
 
 from models import MaskedPosReconCLRViT
 from utils.lr_decay import param_groups_lrd
+from utils.transforms import SimCLRPretrainTransform, imagenet_normalization
 
 
 class PosReconCLR(LightningModule):
@@ -22,6 +22,9 @@ class PosReconCLR(LightningModule):
             num_samples: int,
             batch_size: int,
             num_nodes: int = 1,
+            dataset: str = "imagenet",
+            gaussian_blur: bool = True,
+            jitter_strength: float = 1.,
             img_size: int = 224,
             patch_size: int = 16,
             in_chans: int = 3,
@@ -52,6 +55,9 @@ class PosReconCLR(LightningModule):
 
         self.gpus = gpus
         self.num_nodes = num_nodes
+        self.dataset = dataset
+        self.gaussian_blur = gaussian_blur
+        self.jitter_strength = jitter_strength
         self.num_samples = num_samples
         self.batch_size = batch_size
 
@@ -81,6 +87,15 @@ class PosReconCLR(LightningModule):
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
 
+        if dataset == "imagenet":
+            normalization = imagenet_normalization()
+        self.transform = SimCLRPretrainTransform(
+            img_size=img_size,
+            gaussian_blur=gaussian_blur,
+            jitter_strength=jitter_strength,
+            normalize=normalization,
+        )
+
         self.model = MaskedPosReconCLRViT(
             img_size,
             patch_size,
@@ -101,7 +116,8 @@ class PosReconCLR(LightningModule):
         self.train_iters_per_epoch = num_samples // global_batch_size
 
     def shared_step(self, batch):
-        (img1, img2, _), _ = batch
+        img, _ = batch
+        img1, img2 = self.transform(img)
         img = torch.cat((img1, img2))
         return self.model(img, self.position, self.shuffle,
                           self.mask_ratio, self.temperature)
@@ -191,14 +207,14 @@ class PosReconCLR(LightningModule):
                             help="use fp32 or fp16")
 
         # transform params
-        parser.add_argument("--gaussian_blur", default=True,
-                            action=BooleanOptionalAction, help="add gaussian blur")
-        parser.add_argument("--jitter_strength", type=float, default=1.0,
-                            help="jitter strength")
         parser.add_argument("--dataset", type=str, default="imagenet",
                             help="dataset")
         parser.add_argument("--data_dir", type=str, default="dataset",
                             help="path to dataset")
+        parser.add_argument("--gaussian_blur", default=True,
+                            action=BooleanOptionalAction, help="add gaussian blur")
+        parser.add_argument("--jitter_strength", type=float, default=1.0,
+                            help="jitter strength")
 
         # training params
         parser.add_argument("--fast_dev_run", default=False, type=int)
@@ -251,28 +267,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
-        normalization = imagenet_normalization()
         dm = ImagenetDataModule(data_dir=args.data_dir,
                                 batch_size=args.batch_size,
                                 num_workers=args.num_workers)
         args.num_samples = dm.num_samples
-        args.input_height = dm.dims[-1]
     else:
         raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
 
-    dm.train_transforms = SimCLRTrainDataTransform(
-        input_height=args.input_height,
-        gaussian_blur=args.gaussian_blur,
-        jitter_strength=args.jitter_strength,
-        normalize=normalization,
-    )
-
-    dm.val_transforms = SimCLREvalDataTransform(
-        input_height=args.input_height,
-        gaussian_blur=args.gaussian_blur,
-        jitter_strength=args.jitter_strength,
-        normalize=normalization,
-    )
+    dm.train_transforms = dm.val_transforms = transforms.ToTensor()
 
     model = PosReconCLR(**args.__dict__)
 

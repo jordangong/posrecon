@@ -4,35 +4,37 @@ from functools import partial
 import torch
 from pl_bolts.datamodules import ImagenetDataModule
 from pl_bolts.models.self_supervised import SSLFineTuner
-from pl_bolts.models.self_supervised.simclr.transforms import SimCLRFinetuneTransform
 from pl_bolts.optimizers import LinearWarmupCosineAnnealingLR
-from pl_bolts.transforms.dataset_normalizations import imagenet_normalization
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from timm.data.mixup import Mixup
 from timm.loss.cross_entropy import SoftTargetCrossEntropy
 from torch import nn
+from torchvision import transforms
 
 from main import PosReconCLR
 from models import MaskedPosReconCLRViT
 from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_decay import param_groups_lrd
+from utils.transforms import SimCLRFinetuneTransform, imagenet_normalization
 
 
 class PosReconCLREval(SSLFineTuner):
     def __init__(
-        self,
-        protocol: str = 'linear',
-        optim: str = 'sgd',
-        exclude_bn_bias: bool = True,
-        layer_decay: float = 1.,
-        mixup_alpha: float = 0.,
-        cutmix_alpha: float = 0.,
-        label_smoothing: float = 0.,
-        warmup_epochs: int = 10,
-        start_lr: float = 0.,
-        **kwargs
+            self,
+            protocol: str = 'linear',
+            dataset: str = 'imagenet',
+            img_size: int = 224,
+            optim: str = 'sgd',
+            exclude_bn_bias: bool = True,
+            layer_decay: float = 1.,
+            mixup_alpha: float = 0.,
+            cutmix_alpha: float = 0.,
+            label_smoothing: float = 0.,
+            warmup_epochs: int = 10,
+            start_lr: float = 0.,
+            **kwargs
     ):
         """
         Args:
@@ -53,14 +55,15 @@ class PosReconCLREval(SSLFineTuner):
         self.save_hyperparameters(ignore=['backbone'])
 
         self.protocol = protocol
+        self.dataset = dataset
+        self.optim = optim
+        self.exclude_bn_bias = exclude_bn_bias
         self.mixup = None
         if mixup_alpha > 0. or cutmix_alpha > 0.:
             self.mixup = Mixup(mixup_alpha, cutmix_alpha,
                                label_smoothing=label_smoothing,
                                num_classes=self.linear_layer.n_classes)
         self.label_smoothing = label_smoothing
-        self.optim = optim
-        self.exclude_bn_bias = exclude_bn_bias
         self.layer_decay = layer_decay
         self.warmup_epochs = warmup_epochs
         self.start_lr = start_lr
@@ -69,6 +72,19 @@ class PosReconCLREval(SSLFineTuner):
             self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         else:
             self.criterion = SoftTargetCrossEntropy()
+
+        if dataset == "imagenet":
+            normalization = imagenet_normalization()
+        self.train_transform = SimCLRFinetuneTransform(
+            img_size=img_size,
+            normalize=normalization,
+            eval_transform=False,
+        )
+        self.eval_transform = SimCLRFinetuneTransform(
+            img_size=img_size,
+            normalize=normalization,
+            eval_transform=True,
+        )
 
     def on_train_epoch_start(self) -> None:
         if self.protocol == 'linear':
@@ -90,10 +106,6 @@ class PosReconCLREval(SSLFineTuner):
 
     def shared_step(self, batch):
         x, y = batch
-        target = y.clone()  # get a copy of non-mixup labels
-        if self.mixup is not None:
-            x, y = self.mixup(x, y)
-
         if self.protocol == 'linear':
             with torch.no_grad():
                 feats = self.forward_backbone(x)
@@ -103,10 +115,15 @@ class PosReconCLREval(SSLFineTuner):
         logits = self.linear_layer(feats)
         loss = self.criterion(logits, y)
 
-        return loss, logits, target
+        return loss, logits
 
     def training_step(self, batch, batch_idx):
-        loss, logits, target = self.shared_step(batch)
+        x, y = batch
+        x = self.train_transform(x)
+        target = y.clone()
+        if self.mixup is not None:
+            x, y = self.mixup(x, y)
+        loss, logits = self.shared_step((x, y))
         acc = self.train_acc(logits.softmax(-1), target)
 
         self.log(f"loss/xent_{self.protocol}/train", loss, prog_bar=True)
@@ -117,8 +134,10 @@ class PosReconCLREval(SSLFineTuner):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, logits, target = self.shared_step(batch)
-        self.val_acc(logits.softmax(-1), target)
+        x, y = batch
+        x = self.eval_transform(x)
+        loss, logits = self.shared_step((x, y))
+        self.val_acc(logits.softmax(-1), y)
 
         self.log(f"loss/xent_{self.protocol}/val",
                  loss, prog_bar=True, sync_dist=True)
@@ -127,8 +146,10 @@ class PosReconCLREval(SSLFineTuner):
         return loss
 
     def test_step(self, batch, batch_idx):
-        loss, logits, target = self.shared_step(batch)
-        self.test_acc(logits.softmax(-1), target)
+        x, y = batch
+        x = self.eval_transform(x)
+        loss, logits = self.shared_step((x, y))
+        self.test_acc(logits.softmax(-1), y)
 
         self.log(f"loss/xent_{self.protocol}/test", loss, sync_dist=True)
         self.log(f"acc/{self.protocol}/test_epoch", self.test_acc)
@@ -258,7 +279,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
-        normalization = imagenet_normalization()
         if args.label_pct < 100:
             dm = FewShotImagenetDataModule(args.label_pct,
                                            data_dir=args.data_dir,
@@ -268,27 +288,10 @@ if __name__ == "__main__":
             dm = ImagenetDataModule(data_dir=args.data_dir,
                                     batch_size=args.batch_size,
                                     num_workers=args.num_workers)
-        input_height = dm.dims[-1]
     else:
         raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
 
-    dm.train_transforms = SimCLRFinetuneTransform(
-        input_height=input_height,
-        normalize=normalization,
-        eval_transform=False,
-    )
-
-    dm.val_transforms = SimCLRFinetuneTransform(
-        input_height=input_height,
-        normalize=normalization,
-        eval_transform=True,
-    )
-
-    dm.test_transforms = SimCLRFinetuneTransform(
-        input_height=input_height,
-        normalize=normalization,
-        eval_transform=True,
-    )
+    dm.train_transforms = dm.val_transforms = dm.test_transforms = transforms.ToTensor()
 
     pretrained = PosReconCLR.load_from_checkpoint(args.ckpt_path, strict=False)
     pretained_state_dict = pretrained.state_dict()
@@ -311,6 +314,8 @@ if __name__ == "__main__":
 
     evaluator = PosReconCLREval(
         protocol=args.protocol,
+        dataset=args.dataset,
+        img_size=pretrained.img_size,
         backbone=pretrained.model,
         in_features=pretrained.embed_dim,
         num_classes=dm.num_classes,
