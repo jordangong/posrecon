@@ -5,6 +5,21 @@ import torch
 from kornia.constants import BorderType
 from kornia.filters import filter2d
 from torch import Tensor, nn
+from torchvision import transforms
+
+
+class SimCLRPretrainPreTransform:
+    def __init__(self, img_size: int = 224):
+        self.transform = transforms.Compose([
+            transforms.RandomResizedCrop(img_size),
+            transforms.ToTensor(),
+        ])
+
+    def __call__(self, x):
+        x_1 = self.transform(x)
+        x_2 = self.transform(x)
+
+        return x_1, x_2
 
 
 def imagenet_normalization():
@@ -92,7 +107,7 @@ class RandomSigmaGaussianBlur(K.IntensityAugmentationBase2D):
         )
 
 
-class SimCLRPretrainTransform(nn.Module):
+class SimCLRPretrainPostTransform(nn.Module):
     def __init__(
             self,
             img_size: int = 224,
@@ -129,16 +144,13 @@ class SimCLRPretrainTransform(nn.Module):
             )
 
         if normalize is None:
-            self.train_transform = K.AugmentationSequential(*data_transforms)
+            self.transform = K.AugmentationSequential(*data_transforms)
         else:
-            self.train_transform = K.AugmentationSequential(*data_transforms, normalize)
+            self.transform = K.AugmentationSequential(*data_transforms, normalize)
 
     @torch.no_grad()
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        xi = self.train_transform(x)
-        xj = self.train_transform(x)
-
-        return xi, xj
+    def forward(self, x) -> tuple[Tensor, Tensor]:
+        return self.transform(x)
 
 
 class SimCLRFinetuneTransform(nn.Module):

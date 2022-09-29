@@ -8,11 +8,10 @@ from pytorch_lightning import Trainer, LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
-from torchvision import transforms
 
 from models import MaskedPosReconCLRViT
 from utils.lr_decay import param_groups_lrd
-from utils.transforms import SimCLRPretrainTransform, imagenet_normalization
+from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
 
 
 class PosReconCLR(LightningModule):
@@ -89,7 +88,7 @@ class PosReconCLR(LightningModule):
 
         if dataset == "imagenet":
             normalization = imagenet_normalization()
-        self.transform = SimCLRPretrainTransform(
+        self.transform = SimCLRPretrainPostTransform(
             img_size=img_size,
             gaussian_blur=gaussian_blur,
             jitter_strength=jitter_strength,
@@ -117,8 +116,7 @@ class PosReconCLR(LightningModule):
 
     def shared_step(self, batch):
         img, _ = batch
-        img1, img2 = self.transform(img)
-        img = torch.cat((img1, img2))
+        img = self.transform(torch.cat(img))
         return self.model(img, self.position, self.shuffle,
                           self.mask_ratio, self.temperature)
 
@@ -274,10 +272,7 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
 
-    dm.train_transforms = dm.val_transforms = transforms.Compose([
-        transforms.RandomResizedCrop(args.img_size),
-        transforms.ToTensor(),
-    ])
+    dm.train_transforms = dm.val_transforms = SimCLRPretrainPreTransform(args.img_size)
 
     model = PosReconCLR(**args.__dict__)
 
