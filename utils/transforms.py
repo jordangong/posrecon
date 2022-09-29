@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any
 import kornia.augmentation as K
 import torch
 from kornia.constants import BorderType
-from kornia.filters import filter2d_separable
+from kornia.filters import filter2d
 from torch import Tensor, nn
 
 
@@ -71,7 +71,8 @@ class RandomSigmaGaussianBlur(K.IntensityAugmentationBase2D):
     ) -> torch.Tensor:
         kernel_x: torch.Tensor = self.get_batch_gaussian_kernel1d(kernel_size[1], sigma[1])
         kernel_y: torch.Tensor = self.get_batch_gaussian_kernel1d(kernel_size[0], sigma[0])
-        out = filter2d_separable(input, kernel_x, kernel_y, border_type)
+        out_x = filter2d(input, kernel_x.unsqueeze(1), border_type)
+        out = filter2d(out_x, kernel_y.unsqueeze(-1), border_type)
         return out
 
     def apply_transform(
