@@ -50,8 +50,8 @@ class RandomSigmaGaussianBlur(K.IntensityAugmentationBase2D):
         x = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
         if window_size % 2 == 0:
             x = x + 0.5
-        gauss = torch.exp(-x.pow(2.0) / (2 * sigma ** 2).unsqueeze(-1))
-        return gauss / gauss.sum(-1, keepdim=True)
+        gauss_pow = -x ** 2.0 / (2 * sigma ** 2).unsqueeze(-1)
+        return torch.softmax(gauss_pow, dim=-1)
 
     def get_batch_gaussian_kernel1d(self, kernel_size: int, sigma: Tensor) -> torch.Tensor:
         if not isinstance(kernel_size, int) \
