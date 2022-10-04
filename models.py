@@ -2,6 +2,7 @@ from typing import Callable
 
 import torch
 import torch.nn.functional as F
+from pl_bolts.models.self_supervised.resnets import Bottleneck, ResNet
 from timm.models.vision_transformer import PatchEmbed, Block
 from torch import nn
 
@@ -31,6 +32,38 @@ class SyncFunction(torch.autograd.Function):
         idx_from = torch.distributed.get_rank() * ctx.batch_size
         idx_to = (torch.distributed.get_rank() + 1) * ctx.batch_size
         return grad_input[idx_from:idx_to]
+
+
+class SimCLRResNet(nn.Module):
+
+    def __init__(
+            self,
+            block: Callable = Bottleneck,
+            layers: tuple = (3, 4, 6, 3),
+            embed_dim: int = 2048,
+            proj_dim: int = 128,
+    ):
+        super(SimCLRResNet, self).__init__()
+
+        # Encoder
+        self.encoder = ResNet(block, layers)
+
+        # Projection head
+        self.proj_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.BatchNorm1d(embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, proj_dim),
+        )
+
+    def forward(self, img, position=True, shuffle=True, mask_ratio=0.75, temp=0.01):
+        # img: [batch_size*2, in_chans, height, weight]
+        embed = self.encoder(img)[0]
+        # embed: [batch_size*2, embed_dim]
+        feat = self.proj_head(embed)
+        # reps: [batch_size*2, proj_dim]
+        loss = info_nce_loss(feat, temp)
+        return embed, torch.zeros_like(embed), feat, 0, loss
 
 
 class MaskedPosReconCLRViT(nn.Module):
@@ -211,41 +244,9 @@ class MaskedPosReconCLRViT(nn.Module):
         loss = F.mse_loss(batch_pos_embed_pred, batch_pos_embed_targ)
         return loss
 
-    @staticmethod
-    def info_nce_loss(features, temp, eps=1e-6):
-        feat = F.normalize(features)
-        # feat: [batch_size*2, proj_dim]
-        feat = torch.stack(feat.chunk(2), dim=1)
-        # feat: [batch_size, 2, proj_dim]
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            feat = SyncFunction.apply(feat)
-        # feat: [batch_size (* world_size), 2, proj_dim]
-        feat1, feat2 = feat[:, 0, :], feat[:, 1, :]
-        # feat{1,2}: [batch_size (* world_size), proj_dim]
-        feat = torch.cat((feat1, feat2))
-        # feat: [batch_size*2 (* world_size), proj_dim]
-
-        # All samples, filling diagonal to remove identity similarity ((2N)^2 - 2N)
-        all_sim = (feat @ feat.T).fill_diagonal_(0)
-        # all_sim: [batch_size*2 (* world_size), batch_size*2 (* world_size)]
-        all_ = torch.exp(all_sim / temp).sum(-1)
-        # all_: [batch_size*2 (* world_size)]
-
-        # Positive samples (2N)
-        pos_sim = (feat1 * feat2).sum(-1)
-        # pos_sim: [batch_size (* world_size)]
-        pos = torch.exp(pos_sim / temp)
-        # Following all samples, compute positive similarity twice
-        pos = torch.cat((pos, pos))
-        # pos: [batch_size*2 (* world_size)]
-
-        loss = -torch.log(pos / (all_ + eps)).mean()
-
-        return loss
-
     def forward_loss(self, batch_pos_embed_pred, vis_ids, features, temp=0.1):
         loss_recon = self.pos_recon_loss(batch_pos_embed_pred, vis_ids)
-        loss_clr = self.info_nce_loss(features, temp)
+        loss_clr = info_nce_loss(features, temp)
         return loss_recon, loss_clr
 
     def forward(self, img, position=True, shuffle=True, mask_ratio=0.75, temp=0.01):
@@ -258,3 +259,35 @@ class MaskedPosReconCLRViT(nn.Module):
         # reps: [batch_size*2, proj_dim]
         loss_recon, loss_clr = self.forward_loss(pos_pred, vis_ids, feat, temp)
         return latent, pos_pred, feat, loss_recon, loss_clr
+
+
+def info_nce_loss(features, temp, eps=1e-6):
+    feat = F.normalize(features)
+    # feat: [batch_size*2, proj_dim]
+    feat = torch.stack(feat.chunk(2), dim=1)
+    # feat: [batch_size, 2, proj_dim]
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        feat = SyncFunction.apply(feat)
+    # feat: [batch_size (* world_size), 2, proj_dim]
+    feat1, feat2 = feat[:, 0, :], feat[:, 1, :]
+    # feat{1,2}: [batch_size (* world_size), proj_dim]
+    feat = torch.cat((feat1, feat2))
+    # feat: [batch_size*2 (* world_size), proj_dim]
+
+    # All samples, filling diagonal to remove identity similarity ((2N)^2 - 2N)
+    all_sim = (feat @ feat.T).fill_diagonal_(0)
+    # all_sim: [batch_size*2 (* world_size), batch_size*2 (* world_size)]
+    all_ = torch.exp(all_sim / temp).sum(-1)
+    # all_: [batch_size*2 (* world_size)]
+
+    # Positive samples (2N)
+    pos_sim = (feat1 * feat2).sum(-1)
+    # pos_sim: [batch_size (* world_size)]
+    pos = torch.exp(pos_sim / temp)
+    # Following all samples, compute positive similarity twice
+    pos = torch.cat((pos, pos))
+    # pos: [batch_size*2 (* world_size)]
+
+    loss = -torch.log(pos / (all_ + eps)).mean()
+
+    return loss

@@ -16,7 +16,7 @@ from torchvision import transforms
 from main import PosReconCLR
 from models import MaskedPosReconCLRViT
 from utils.datamodules import FewShotImagenetDataModule
-from utils.lr_decay import param_groups_lrd
+from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRFinetuneTransform, imagenet_normalization
 
 
@@ -92,7 +92,10 @@ class PosReconCLREval(SSLFineTuner):
         elif self.protocol == 'finetune':
             self.backbone.train()
 
-    def forward_backbone(self, x):
+    def forward_resnet(self, x):
+        return self.backbone.encoder(x)[0]
+
+    def forward_vit(self, x):
         x = self.backbone.patch_embed(x)
         x += self.backbone.pos_embed
 
@@ -103,6 +106,12 @@ class PosReconCLREval(SSLFineTuner):
         x = self.backbone.norm(x)
 
         return x[:, 0, :]
+
+    def forward_backbone(self, x):
+        if isinstance(self.backbone, MaskedPosReconCLRViT):
+            return self.forward_vit(x)
+        else:
+            return self.forward_resnet(x)
 
     def shared_step(self, batch):
         x, y = batch
@@ -160,30 +169,39 @@ class PosReconCLREval(SSLFineTuner):
         param_groups = []
         # add backbone to params_groups while finetuning
         if self.protocol == "finetune":
-            param_groups += param_groups_lrd(
-                self.backbone,
-                lr=self.learning_rate,
-                weight_decay=self.weight_decay,
-                exclude_1d_params=self.exclude_bn_bias,
-                no_weight_decay_list=("pos_embed", "cls_token"),
-                layer_decay=self.layer_decay
-            )
+            if isinstance(self.backbone, MaskedPosReconCLRViT):
+                param_groups += param_groups_lrd(
+                    self.backbone,
+                    lr=self.learning_rate,
+                    weight_decay=self.weight_decay,
+                    exclude_1d_params=self.exclude_bn_bias,
+                    no_weight_decay_list=("pos_embed", "cls_token"),
+                    layer_decay=self.layer_decay
+                )
+            else:  # ResNet
+                if self.exclude_bn_bias:
+                    resnet_param_groups = exclude_from_wt_decay(
+                        self.backbone,
+                        self.weight_decay,
+                    )
+                else:
+                    resnet_param_groups = [{
+                        "params": self.backbone.parameters(),
+                        "weight_decay": self.weight_decay
+                    }]
+                param_groups += resnet_param_groups
+
         # add linear head
         if self.exclude_bn_bias:
-            linear_include_params, linear_exclude_params = [], []
-            for param in self.linear_layer.parameters():
-                if param.ndim == 1:
-                    linear_exclude_params.append(param)
-                else:
-                    linear_include_params.append(param)
-            linear_param_groups = [
-                {"params": linear_exclude_params, "weight_decay": 0.},
-                {"params": linear_include_params, "weight_decay": self.weight_decay}
-            ]
+            linear_param_groups = exclude_from_wt_decay(
+                self.linear_layer,
+                self.weight_decay,
+            )
         else:
-            linear_param_groups = [
-                {"params": self.linear_layer.parameters(), "weight_decay": self.weight_decay}
-            ]
+            linear_param_groups = [{
+                "params": self.linear_layer.parameters(),
+                "weight_decay": self.weight_decay
+            }]
         param_groups += linear_param_groups
 
         if self.optim == "sdg":
@@ -279,23 +297,24 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     pretrained = PosReconCLR.load_from_checkpoint(args.ckpt_path, strict=False)
-    pretained_state_dict = pretrained.state_dict()
-    # a bit hacky here, replace backbone with dropout rate
-    pretrained.model = MaskedPosReconCLRViT(
-        pretrained.img_size,
-        pretrained.patch_size,
-        pretrained.in_chans,
-        pretrained.embed_dim,
-        pretrained.depth,
-        pretrained.num_heads,
-        pretrained.mlp_ratio,
-        pretrained.proj_dim,
-        drop_rate=args.mlp_dropout,
-        attention_drop_rate=args.attention_dropout,
-        drop_path_rate=args.path_dropout,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),
-    )
-    pretrained.load_state_dict(pretained_state_dict)
+    # a bit hacky here, replace ViT with dropout rate
+    if isinstance(pretrained.model, MaskedPosReconCLRViT):
+        pretained_state_dict = pretrained.state_dict()
+        pretrained.model = MaskedPosReconCLRViT(
+            pretrained.img_size,
+            pretrained.patch_size,
+            pretrained.in_chans,
+            pretrained.embed_dim,
+            pretrained.depth,
+            pretrained.num_heads,
+            pretrained.mlp_ratio,
+            pretrained.proj_dim,
+            drop_rate=args.mlp_dropout,
+            attention_drop_rate=args.attention_dropout,
+            drop_path_rate=args.path_dropout,
+            norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        )
+        pretrained.load_state_dict(pretained_state_dict)
 
     if args.dataset == "imagenet":
         if args.label_pct < 100:
