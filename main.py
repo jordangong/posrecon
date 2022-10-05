@@ -298,6 +298,7 @@ if __name__ == '__main__':
     parser.add_argument("--version", default=None, type=str)
     parser.add_argument("--log_path", default="lightning_logs", type=str)
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
+    parser.add_argument("--track_grad", default=True, type=BooleanOptionalAction)
     parser = PosReconCLR.add_model_specific_args(parser)
     args = parser.parse_args()
 
@@ -326,6 +327,7 @@ if __name__ == '__main__':
         accelerator="gpu" if args.gpus > 0 else None,
         strategy="ddp_find_unused_parameters_false" if args.gpus > 1 else None,
         sync_batchnorm=True if args.gpus > 1 else False,
+        track_grad_norm=2 if args.track_grad else -1,
         precision=32 if args.fp32 else 16,
         callbacks=callbacks,
         logger=logger,
