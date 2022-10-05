@@ -49,7 +49,7 @@ class PosReconCLREval(SSLFineTuner):
             start_lr: start learning rate
         """
         assert protocol in {'linear', 'finetune'}, f"unknown protocol: {protocol}"
-        assert optim in {'sgd', 'adam'}, f"unknown optimizer: {optim}"
+        assert optim in {'sgd', 'adam', 'adamw'}, f"unknown optimizer: {optim}"
 
         super().__init__(**kwargs)
         self.save_hyperparameters(ignore=['backbone'])
@@ -213,6 +213,8 @@ class PosReconCLREval(SSLFineTuner):
             )
         elif self.optim == "adam":
             optimizer = torch.optim.Adam(param_groups, lr=self.learning_rate)
+        elif self.optim == "adamw":
+            optimizer = torch.optim.AdamW(param_groups, lr=self.learning_rate)
 
         # set scheduler
         if self.scheduler_type == "step":

@@ -188,6 +188,8 @@ class PosReconCLR(LightningModule):
             optimizer = LARS(param_groups, lr=self.learning_rate, momentum=0.9)
         elif self.optim == "adam":
             optimizer = torch.optim.Adam(param_groups, lr=self.learning_rate)
+        elif self.optim == "adamw":
+            optimizer = torch.optim.AdamW(param_groups, lr=self.learning_rate)
 
         warmup_steps = self.train_iters_per_epoch * self.warmup_epochs
         total_steps = self.train_iters_per_epoch * self.max_epochs
