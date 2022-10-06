@@ -2,8 +2,9 @@ from argparse import ArgumentParser, BooleanOptionalAction
 from functools import partial
 
 import torch
+import torch_optimizer as optim
 from pl_bolts.datamodules import ImagenetDataModule
-from pl_bolts.optimizers import linear_warmup_decay, LARS
+from pl_bolts.optimizers import linear_warmup_decay
 from pytorch_lightning import Trainer, LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -185,9 +186,11 @@ class PosReconCLR(LightningModule):
                 }
 
         if self.optim == "lars":
-            optimizer = LARS(param_groups, lr=self.learning_rate, momentum=0.9)
+            optimizer = optim.LARS(param_groups, lr=self.learning_rate, momentum=0.9)
         elif self.optim == "adam":
             optimizer = torch.optim.Adam(param_groups, lr=self.learning_rate)
+        elif self.optim == "lamb":
+            optimizer = optim.Lamb(param_groups, lr=self.learning_rate)
         elif self.optim == "adamw":
             optimizer = torch.optim.AdamW(param_groups, lr=self.learning_rate)
 
