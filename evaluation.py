@@ -26,12 +26,13 @@ class PosReconCLREval(SSLFineTuner):
             protocol: str = 'linear',
             dataset: str = 'imagenet',
             img_size: int = 224,
+            position: bool = True,
             optim: str = 'sgd',
             exclude_bn_bias: bool = True,
-            layer_decay: float = 1.,
             mixup_alpha: float = 0.,
             cutmix_alpha: float = 0.,
             label_smoothing: float = 0.,
+            layer_decay: float = 1.,
             warmup_epochs: int = 10,
             start_lr: float = 0.,
             **kwargs
@@ -39,6 +40,9 @@ class PosReconCLREval(SSLFineTuner):
         """
         Args:
             protocol: evaluation protocol, including `linear` and `finetune`
+            dataset: name of dataset for evaluation
+            img_size: input image size
+            position: add positional embedding or not
             optim: optimizer (SGD or Adam)
             exclude_bn_bias: exclude weight decay on 1d params (e.g. bn/ln and bias)
             mixup_alpha: mixup alpha, active if > 0.
@@ -56,6 +60,7 @@ class PosReconCLREval(SSLFineTuner):
 
         self.protocol = protocol
         self.dataset = dataset
+        self.position = position
         self.optim = optim
         self.exclude_bn_bias = exclude_bn_bias
         self.mixup = None
@@ -95,9 +100,10 @@ class PosReconCLREval(SSLFineTuner):
     def forward_resnet(self, x):
         return self.backbone.encoder(x)[0]
 
-    def forward_vit(self, x):
+    def forward_vit(self, x, position=True):
         x = self.backbone.patch_embed(x)
-        x += self.backbone.pos_embed
+        if position:
+            x += self.backbone.pos_embed
 
         cls_tokens = self.backbone.cls_token.expand(x.size(0), -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
@@ -109,7 +115,7 @@ class PosReconCLREval(SSLFineTuner):
 
     def forward_backbone(self, x):
         if isinstance(self.backbone, MaskedPosReconCLRViT):
-            return self.forward_vit(x)
+            return self.forward_vit(x, self.position)
         else:
             return self.forward_resnet(x)
 
@@ -269,6 +275,7 @@ class PosReconCLREval(SSLFineTuner):
         parser.add_argument("--fast_dev_run", default=False, type=int)
 
         # fine-tuner params
+        parser.add_argument("--position", default=True, action=BooleanOptionalAction)
         parser.add_argument("--mlp_dropout", type=float, default=0.0)
         parser.add_argument("--attention_dropout", type=float, default=0.0)
         parser.add_argument("--path_dropout", type=float, default=0.0)
@@ -348,6 +355,7 @@ if __name__ == "__main__":
         protocol=args.protocol,
         dataset=args.dataset,
         img_size=pretrained.img_size,
+        position=args.position,
         backbone=pretrained.model,
         in_features=pretrained.embed_dim,
         num_classes=dm.num_classes,
