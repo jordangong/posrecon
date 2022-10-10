@@ -33,7 +33,7 @@ class PosReconCLR(LightningModule):
             embed_dim: int = 768,
             encoder_depth: int = 12,
             encoder_num_heads: int = 12,
-            decoder_depth: int = 3,
+            decoder_depth: int = 0,
             decoder_num_heads: int = 12,
             mlp_ratio: int = 4,
             proj_dim: int = 128,
@@ -229,8 +229,9 @@ class PosReconCLR(LightningModule):
                             help="encoder number of Transformer blocks")
         parser.add_argument("--encoder_num_heads", default=12, type=int,
                             help="encoder number of self-attention heads")
-        parser.add_argument("--decoder_depth", default=3, type=int,
-                            help="decoder number of Transformer blocks")
+        parser.add_argument("--decoder_depth", default=0, type=int,
+                            help="decoder number of Transformer blocks, "
+                            "set it to 0 for linear layer")
         parser.add_argument("--decoder_num_heads", default=12, type=int,
                             help="decoder number of self-attention heads")
         parser.add_argument("--mlp_ratio", default=4, type=int,
