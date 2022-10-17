@@ -2,7 +2,7 @@ from argparse import ArgumentParser, BooleanOptionalAction
 from functools import partial
 
 import torch
-from pl_bolts.datamodules import ImagenetDataModule
+from pl_bolts.datamodules import ImagenetDataModule, CIFAR10DataModule
 from pl_bolts.models.self_supervised import SSLFineTuner
 from pl_bolts.optimizers import LinearWarmupCosineAnnealingLR
 from pytorch_lightning import Trainer
@@ -17,7 +17,7 @@ from main import PosReconCLR
 from models import MaskedPosReconCLRViT
 from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
-from utils.transforms import SimCLRFinetuneTransform, imagenet_normalization
+from utils.transforms import SimCLRFinetuneTransform, imagenet_normalization, cifar10_normalization
 
 
 class PosReconCLREval(SSLFineTuner):
@@ -80,6 +80,8 @@ class PosReconCLREval(SSLFineTuner):
 
         if dataset == "imagenet":
             normalization = imagenet_normalization()
+        elif dataset == "cifar10":
+            normalization = cifar10_normalization()
         self.train_transform = SimCLRFinetuneTransform(
             img_size=img_size,
             normalize=normalization,
@@ -328,18 +330,22 @@ if __name__ == "__main__":
         )
         pretrained.load_state_dict(pretained_state_dict)
 
-    if args.dataset == "imagenet":
-        if args.label_pct < 100:
+    if args.label_pct < 100:
+        if args.dataset == "imagenet":
             dm = FewShotImagenetDataModule(args.label_pct,
                                            data_dir=args.data_dir,
                                            batch_size=args.batch_size,
                                            num_workers=args.num_workers)
         else:
-            dm = ImagenetDataModule(data_dir=args.data_dir,
-                                    batch_size=args.batch_size,
-                                    num_workers=args.num_workers)
+            raise NotImplementedError(f"Unimplemented few-shot dataset: {args.dataset}")
     else:
-        raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
+        if args.dataset == "imagenet":
+            dm = ImagenetDataModule
+        elif args.dataset == "cifar10":
+            dm = CIFAR10DataModule
+        else:
+            raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
+        dm = dm(data_dir=args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers)
 
     dm.train_transforms = transforms.Compose([
         transforms.RandomResizedCrop(pretrained.img_size),

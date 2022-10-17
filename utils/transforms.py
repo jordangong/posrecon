@@ -26,6 +26,13 @@ def imagenet_normalization():
     return K.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 
+def cifar10_normalization():
+    return K.Normalize(
+        mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
+        std=[x / 255.0 for x in [63.0, 62.1, 66.7]],
+    )
+
+
 class RandomSigmaGaussianBlur(K.IntensityAugmentationBase2D):
     """
     Implements Gaussian blur as described in the SimCLR paper
