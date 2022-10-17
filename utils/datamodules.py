@@ -1,12 +1,13 @@
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from pl_bolts.datamodules import ImagenetDataModule, CIFAR10DataModule
+from pl_bolts.datamodules.vision_datamodule import VisionDataModule
 from pl_bolts.datasets import UnlabeledImagenet
 from pl_bolts.utils import _TORCHVISION_AVAILABLE
 from pl_bolts.utils.warnings import warn_missing_pkg
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
-from torchvision.datasets import CIFAR100, Flowers102
+from torchvision.datasets import CIFAR100, Flowers102, OxfordIIITPet
 
 if _TORCHVISION_AVAILABLE:
     from torchvision import transforms as transform_lib
@@ -14,15 +15,39 @@ else:  # pragma: no cover
     warn_missing_pkg("torchvision")
 
 
+def default_train_transform(
+        image_size: int,
+        normalization: Callable,
+) -> Callable:
+    return transform_lib.Compose([
+        transform_lib.RandomResizedCrop(image_size),
+        transform_lib.RandomHorizontalFlip(),
+        transform_lib.ToTensor(),
+        normalization(),
+    ])
+
+
+def default_val_transform(
+        image_size: int,
+        normalization: Callable,
+) -> Callable:
+    return transform_lib.Compose([
+        transform_lib.Resize(int(image_size + 0.1 * image_size)),
+        transform_lib.CenterCrop(image_size),
+        transform_lib.ToTensor(),
+        normalization(),
+    ])
+
+
 class FewShotImagenetDataModule(ImagenetDataModule):
     name = "few-shot-imagenet"
 
-    def __init__(self, label_pct, **kwargs):
+    def __init__(self, *args, label_pct: int = 1, **kwargs):
         """
         Args:
             label_pct: % of labels for training
         """
-        super().__init__(**kwargs)
+        super().__init__(*args, **kwargs)
         self.label_pct = label_pct
         self.num_samples = int(label_pct / 100 * self.num_samples)
 
@@ -116,9 +141,6 @@ class Flowers102DataModule(LightningDataModule):
         self.pin_memory = pin_memory
         self.drop_last = drop_last
 
-        self.train_transforms = None
-        self.val_transforms = None
-
     @property
     def num_classes(self) -> int:
         return 102
@@ -130,12 +152,12 @@ class Flowers102DataModule(LightningDataModule):
     def normalization() -> Callable:
         return transform_lib.Normalize(
             mean=[x / 255.0 for x in [110.4, 97.4, 75.6]],
-            std=[x / 255.0 for x in [15.3, 14.8, 20.5]],
+            std=[x / 255.0 for x in [75.1, 62.9, 69.7]],
         )
 
     def train_dataloader(self) -> DataLoader:
         if self.train_transforms is None:
-            transforms = self.train_transform()
+            transforms = default_train_transform(self.image_size, self.normalization)
         else:
             transforms = self.train_transforms
 
@@ -153,7 +175,7 @@ class Flowers102DataModule(LightningDataModule):
 
     def val_dataloader(self) -> DataLoader:
         if self.val_transforms is None:
-            transforms = self.val_transform()
+            transforms = default_val_transform(self.image_size, self.normalization)
         else:
             transforms = self.val_transforms
 
@@ -171,9 +193,9 @@ class Flowers102DataModule(LightningDataModule):
 
     def test_dataloader(self) -> DataLoader:
         if self.val_transforms is None:
-            transforms = self.val_transform()
+            transforms = default_val_transform(self.image_size, self.normalization)
         else:
-            transforms = self.val_transforms
+            transforms = self.test_transforms
 
         dataset = Flowers102(self.data_dir, split='test', transform=transforms)
         loader = DataLoader(
@@ -187,26 +209,78 @@ class Flowers102DataModule(LightningDataModule):
 
         return loader
 
-    def train_transform(self) -> Callable:
-        preprocessing = transform_lib.Compose(
-            [
-                transform_lib.RandomResizedCrop(self.image_size),
-                transform_lib.RandomHorizontalFlip(),
-                transform_lib.ToTensor(),
-                self.normalization(),
-            ]
+
+class OxfordIIITPetDataModule(VisionDataModule):
+    name = "oxford-iit-pet"
+    dataset_cls = OxfordIIITPet
+
+    def __init__(self, *args, image_size: int = 224, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.image_size = image_size
+
+    def prepare_data(self, *args: Any, **kwargs: Any) -> None:
+        """
+        Saves files to data_dir.
+        Splits in Oxford IIIT Pet are specified using `split` argument rather
+        than `train` in torchvision, we need to override the default method.
+        """
+        self.dataset_cls(self.data_dir, download=True)
+
+    def setup(self, stage: Optional[str] = None) -> None:
+        """
+        Creates train, val, and test dataset.
+        Splits in Oxford IIIT Pet are specified using `split` argument rather
+        than `train` in torchvision, we need to override the default method.
+        """
+        if stage == "fit" or stage is None:
+            if self.train_transforms is None:
+                train_transforms = default_train_transform(self.image_size, self.normalization)
+            else:
+                train_transforms = self.train_transforms
+            if self.val_transforms is None:
+                val_transforms = default_val_transform(self.image_size, self.normalization)
+            else:
+                val_transforms = self.val_transforms
+
+            dataset_train = self.dataset_cls(
+                self.data_dir,
+                split='trainval',
+                transform=train_transforms,
+                **self.EXTRA_ARGS,
+            )
+            dataset_val = self.dataset_cls(
+                self.data_dir,
+                split='trainval',
+                transform=val_transforms,
+                **self.EXTRA_ARGS,
+            )
+
+            # Split
+            self.dataset_train = self._split_dataset(dataset_train)
+            self.dataset_val = self._split_dataset(dataset_val, train=False)
+
+        if stage == "test" or stage is None:
+            if self.test_transforms is None:
+                test_transforms = default_val_transform(self.image_size, self.normalization)
+            else:
+                test_transforms = self.test_transforms
+            self.dataset_test = self.dataset_cls(
+                self.data_dir,
+                split='test',
+                transform=test_transforms,
+                **self.EXTRA_ARGS,
+            )
+
+    @staticmethod
+    def normalization() -> Callable:
+        return transform_lib.Normalize(
+            mean=[x / 255.0 for x in [122., 113.7, 100.9]],
+            std=[x / 255.0 for x in [68.3, 67.1, 68.8]],
         )
 
-        return preprocessing
+    @property
+    def num_classes(self) -> int:
+        return 37
 
-    def val_transform(self) -> Callable:
-        preprocessing = transform_lib.Compose(
-            [
-                transform_lib.Resize(int(self.image_size + 0.1 * self.image_size)),
-                transform_lib.CenterCrop(self.image_size),
-                transform_lib.ToTensor(),
-                self.normalization(),
-            ]
-        )
-
-        return preprocessing
+    def default_transforms(self) -> Callable:
+        return default_val_transform(self.image_size, self.normalization)

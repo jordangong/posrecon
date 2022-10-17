@@ -43,7 +43,14 @@ def cifar100_normalization():
 def flower102_normalization():
     return K.Normalize(
         mean=[x / 255.0 for x in [110.4, 97.4, 75.6]],
-        std=[x / 255.0 for x in [15.3, 14.8, 20.5]],
+        std=[x / 255.0 for x in [75.1, 62.9, 69.7]],
+    )
+
+
+def oxford_iiit_pet_normalization():
+    return K.Normalize(
+        mean=[x / 255.0 for x in [122., 113.7, 100.9]],
+        std=[x / 255.0 for x in [68.3, 67.1, 68.8]],
     )
 
 

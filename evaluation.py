@@ -16,10 +16,11 @@ from torchvision import transforms
 from main import PosReconCLR
 from models import MaskedPosReconCLRViT
 from utils.datamodules import FewShotImagenetDataModule, CIFAR100DataModule, \
-    Flowers102DataModule
+    Flowers102DataModule, OxfordIIITPetDataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRFinetuneTransform, imagenet_normalization, \
-    cifar10_normalization, cifar100_normalization, flower102_normalization
+    cifar10_normalization, cifar100_normalization, flower102_normalization, \
+    oxford_iiit_pet_normalization
 
 
 class PosReconCLREval(SSLFineTuner):
@@ -88,6 +89,8 @@ class PosReconCLREval(SSLFineTuner):
             normalization = cifar100_normalization()
         elif dataset == "flowers102":
             normalization = flower102_normalization()
+        elif dataset == "oxford_iiit_pet":
+            normalization = oxford_iiit_pet_normalization()
         self.train_transform = SimCLRFinetuneTransform(
             img_size=img_size,
             normalize=normalization,
@@ -354,6 +357,8 @@ if __name__ == "__main__":
             dm = CIFAR100DataModule
         elif args.dataset == "flowers102":
             dm = Flowers102DataModule
+        elif args.dataset == "oxford_iiit_pet":
+            dm = OxfordIIITPetDataModule
         else:
             raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
         dm = dm(data_dir=args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers)
