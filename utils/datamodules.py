@@ -1,6 +1,7 @@
-from pl_bolts.datamodules import ImagenetDataModule
+from pl_bolts.datamodules import ImagenetDataModule, CIFAR10DataModule
 from pl_bolts.datasets import UnlabeledImagenet
 from torch.utils.data import DataLoader
+from torchvision.datasets import CIFAR100
 
 
 class FewShotImagenetDataModule(ImagenetDataModule):
@@ -46,3 +47,12 @@ class FewShotImagenetDataModule(ImagenetDataModule):
         )
 
         return loader
+
+
+class CIFAR100DataModule(CIFAR10DataModule):
+    name = "cifar100"
+    dataset_cls = CIFAR100
+
+    @property
+    def num_classes(self) -> int:
+        return 100
