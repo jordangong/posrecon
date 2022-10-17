@@ -40,6 +40,13 @@ def cifar100_normalization():
     )
 
 
+def flower102_normalization():
+    return K.Normalize(
+        mean=[x / 255.0 for x in [110.4, 97.4, 75.6]],
+        std=[x / 255.0 for x in [15.3, 14.8, 20.5]],
+    )
+
+
 class RandomSigmaGaussianBlur(K.IntensityAugmentationBase2D):
     """
     Implements Gaussian blur as described in the SimCLR paper

@@ -15,10 +15,11 @@ from torchvision import transforms
 
 from main import PosReconCLR
 from models import MaskedPosReconCLRViT
-from utils.datamodules import FewShotImagenetDataModule, CIFAR100DataModule
+from utils.datamodules import FewShotImagenetDataModule, CIFAR100DataModule, \
+    Flowers102DataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRFinetuneTransform, imagenet_normalization, \
-    cifar10_normalization, cifar100_normalization
+    cifar10_normalization, cifar100_normalization, flower102_normalization
 
 
 class PosReconCLREval(SSLFineTuner):
@@ -85,6 +86,8 @@ class PosReconCLREval(SSLFineTuner):
             normalization = cifar10_normalization()
         elif dataset == "cifar100":
             normalization = cifar100_normalization()
+        elif dataset == "flowers102":
+            normalization = flower102_normalization()
         self.train_transform = SimCLRFinetuneTransform(
             img_size=img_size,
             normalize=normalization,
@@ -306,6 +309,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--version", default=None, type=str)
     parser.add_argument("--log_path", default="lightning_logs", type=str)
+    parser.add_argument("--log_steps", default=50, type=int)
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, type=BooleanOptionalAction)
     parser = PosReconCLREval.add_model_specific_args(parser)
@@ -348,6 +352,8 @@ if __name__ == "__main__":
             dm = CIFAR10DataModule
         elif args.dataset == "cifar100":
             dm = CIFAR100DataModule
+        elif args.dataset == "flowers102":
+            dm = Flowers102DataModule
         else:
             raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
         dm = dm(data_dir=args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers)
@@ -408,6 +414,7 @@ if __name__ == "__main__":
         precision=32 if args.fp32 else 16,
         callbacks=callbacks,
         logger=logger,
+        log_every_n_steps=args.log_steps,
         fast_dev_run=args.fast_dev_run,
     )
 
