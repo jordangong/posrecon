@@ -45,6 +45,7 @@ class PosReconCLR(LightningModule):
             position: bool = True,
             shuffle: bool = True,
             mask_ratio: float = 0.75,
+            attn_mask: bool = False,
             temperature: float = 0.1,
             loss_ratio: float = 1.,
             optimizer: str = "adam",
@@ -91,6 +92,7 @@ class PosReconCLR(LightningModule):
         self.position = position
         self.shuffle = shuffle
         self.mask_ratio = mask_ratio
+        self.attn_mask = attn_mask
         self.temperature = temperature
         self.loss_ratio = loss_ratio
 
@@ -135,8 +137,8 @@ class PosReconCLR(LightningModule):
     def shared_step(self, batch):
         img, _ = batch
         img = self.transform(torch.cat(img))
-        return self.model(img, self.position, self.shuffle,
-                          self.mask_ratio, self.temperature)
+        return self.model(img, self.position, self.shuffle, self.mask_ratio,
+                          self.attn_mask, self.temperature)
 
     def training_step(self, batch, batch_idx):
         latent, pos_embed_pred, proj_embed, loss_recon, loss_clr = self.shared_step(batch)
@@ -231,7 +233,7 @@ class PosReconCLR(LightningModule):
                             help="encoder number of self-attention heads")
         parser.add_argument("--decoder_depth", default=0, type=int,
                             help="decoder number of Transformer blocks, "
-                            "set it to 0 for linear layer")
+                                 "set it to 0 for linear layer")
         parser.add_argument("--decoder_num_heads", default=12, type=int,
                             help="decoder number of self-attention heads")
         parser.add_argument("--mlp_ratio", default=4, type=int,
@@ -285,6 +287,8 @@ class PosReconCLR(LightningModule):
                             help="shuffle patches or not")
         parser.add_argument("--mask_ratio", default=0.75, type=float,
                             help="mask ratio of patches")
+        parser.add_argument("--attn_mask", default=False, action='store_true',
+                            help="mask high attention weight patches")
         parser.add_argument("--temperature", default=0.1, type=float,
                             help="temperature parameter in InfoNCE loss")
         parser.add_argument("--loss_ratio", default=1., type=float,

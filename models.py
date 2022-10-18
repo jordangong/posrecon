@@ -190,13 +190,15 @@ class MaskedPosReconCLRViT(nn.Module):
         return x + batch_shuffled_pos_embed
 
     @staticmethod
-    def rand_mask(x, mask_ratio):
+    def first_k_mask(x, mask_ratio, indices):
+        """
+        Leave first $k = seq_len * (1 - mask_ratio)$ elements after masking
+        indices: [batch_size, seq_len]
+        """
+
         batch_size, seq_len, embed_dim = x.size()
         visible_len = int(seq_len * (1 - mask_ratio))
-        noise = torch.rand(batch_size, seq_len, device=x.device)
-        shuffled_indices = noise.argsort()
-        # shuffled_indices: [batch_size, seq_len]
-        visible_indices = shuffled_indices[:, :visible_len]
+        visible_indices = indices[:, :visible_len]
         # visible_indices: [batch_size, seq_len * mask_ratio]
         expand_visible_indices = visible_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
         # expand_visible_indices: [batch_size, seq_len * mask_ratio, embed_dim]
@@ -205,7 +207,48 @@ class MaskedPosReconCLRViT(nn.Module):
 
         return x_masked, expand_visible_indices
 
-    def forward_encoder(self, x, position, shuffle, mask_ratio):
+    def rand_mask(self, x, mask_ratio):
+        batch_size, seq_len, embed_dim = x.size()
+        noise = torch.rand(batch_size, seq_len, device=x.device)
+        shuffled_indices = noise.argsort()
+        # shuffled_indices: [batch_size, seq_len]
+
+        return self.first_k_mask(x, mask_ratio, shuffled_indices)
+
+    @torch.no_grad()
+    def pay_attention(self, x):
+        batch_size, seq_len, embed_dim = x.size()
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        x = self.blocks[:-1](x)
+        x = self.blocks[-1].norm1(x)
+        last_attention = self.blocks[-1].attn
+
+        qkv = last_attention.qkv(x)
+        qkv = qkv.reshape(batch_size, 1 + seq_len, 3, last_attention.num_heads,
+                          embed_dim // last_attention.num_heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        # q, k, v: [batch_size, num_heads, 1+seq_len, embed_dim // num_heads]
+
+        attention_weight = (q @ k.transpose(-2, -1)) * last_attention.scale
+        attention_weight = attention_weight.softmax(dim=-1)
+        # attention_weight: [batch_size, num_heads, 1+seq_len, 1+seq_len]
+
+        return attention_weight
+
+    def attn_mask(self, x, mask_ratio):
+        attn_weight = self.pay_attention(x)
+        # attn_weight: [batch_size, num_heads, 1+seq_len, 1+seq_len]
+        cls_attn_weight = attn_weight[:, :, 0, 1:]
+        # cls_attn_weight: [batch_size, num_heads, seq_len]
+        cls_attn_head_avg_weight = cls_attn_weight.mean(1)
+        # cls_attn_head_avg_weight: [batch_size, seq_len]
+        attn_ranked_indices = cls_attn_head_avg_weight.argsort()
+
+        return self.first_k_mask(x, mask_ratio, attn_ranked_indices)
+
+    def forward_encoder(self, x, position, shuffle, mask_ratio, attn_mask):
         x = self.patch_embed(x)
 
         if position:
@@ -219,7 +262,10 @@ class MaskedPosReconCLRViT(nn.Module):
             # make `visible_indices` empty when all patches are visible
             visible_indices = None
         else:
-            x, visible_indices = self.rand_mask(x, mask_ratio)
+            if attn_mask:
+                x, visible_indices = self.attn_mask(x, mask_ratio)
+            else:
+                x, visible_indices = self.rand_mask(x, mask_ratio)
         # batch_size*2, seq_len * mask_ratio, embed_dim
 
         # Concatenate [CLS] tokens w/o pos_embed
@@ -266,9 +312,12 @@ class MaskedPosReconCLRViT(nn.Module):
         loss_clr = info_nce_loss(features, temp)
         return loss_recon, loss_clr
 
-    def forward(self, img, position=True, shuffle=True, mask_ratio=0.75, temp=0.01):
+    def forward(self, img, position=True, shuffle=True,
+                mask_ratio=0.75, attn_mask=False, temp=0.01):
         # img: [batch_size*2, in_chans, height, weight]
-        latent, vis_ids = self.forward_encoder(img, position, shuffle, mask_ratio)
+        latent, vis_ids = self.forward_encoder(
+            img, position, shuffle, mask_ratio, attn_mask
+        )
         # latent: [batch_size*2, 1 + seq_len * mask_ratio, embed_dim]
         pos_pred = self.forward_pos_decoder(latent[:, 1:, :])
         # pos_pred: [batch_size*2, seq_len * mask_ratio, embed_dim]
@@ -286,7 +335,7 @@ def info_nce_loss(features, temp, eps=1e-6):
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         feat = SyncFunction.apply(feat)
     # feat: [batch_size (* world_size), 2, proj_dim]
-    feat1, feat2 = feat[:, 0, :], feat[:, 1, :]
+    feat1, feat2 = feat.unbind(1)
     # feat{1,2}: [batch_size (* world_size), proj_dim]
     feat = torch.cat((feat1, feat2))
     # feat: [batch_size*2 (* world_size), proj_dim]
