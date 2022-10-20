@@ -46,6 +46,7 @@ class PosReconCLR(LightningModule):
             shuffle: bool = True,
             mask_ratio: float = 0.75,
             attn_mask: bool = False,
+            hint_ratio: float = 0.,
             temperature: float = 0.1,
             loss_ratio: float = 1.,
             optimizer: str = "adam",
@@ -93,6 +94,7 @@ class PosReconCLR(LightningModule):
         self.shuffle = shuffle
         self.mask_ratio = mask_ratio
         self.attn_mask = attn_mask
+        self.hint_ratio = hint_ratio
         self.temperature = temperature
         self.loss_ratio = loss_ratio
 
@@ -138,7 +140,7 @@ class PosReconCLR(LightningModule):
         img, _ = batch
         img = self.transform(torch.cat(img))
         return self.model(img, self.position, self.shuffle, self.mask_ratio,
-                          self.attn_mask, self.temperature)
+                          self.attn_mask, self.hint_ratio, self.temperature)
 
     def training_step(self, batch, batch_idx):
         latent, pos_embed_pred, proj_embed, loss_recon, loss_clr = self.shared_step(batch)
@@ -289,6 +291,9 @@ class PosReconCLR(LightningModule):
                             help="mask ratio of patches")
         parser.add_argument("--attn_mask", default=False, action='store_true',
                             help="mask high attention weight patches")
+        parser.add_argument("--hint_ratio", default=0., type=float,
+                            help="attention hint ratio "
+                                 "(leave some high attention patches)")
         parser.add_argument("--temperature", default=0.1, type=float,
                             help="temperature parameter in InfoNCE loss")
         parser.add_argument("--loss_ratio", default=1., type=float,

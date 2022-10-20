@@ -190,15 +190,24 @@ class MaskedPosReconCLRViT(nn.Module):
         return x + batch_shuffled_pos_embed
 
     @staticmethod
-    def first_k_mask(x, mask_ratio, indices):
+    def mask_interval(x, mask_ratio, left_ratio, indices):
         """
-        Leave first $k = seq_len * (1 - mask_ratio)$ elements after masking
+        Leave $seq_len * (1 - mask_ratio)$ elements after center masking,
+        with $seq_len * left_ratio$ elements tailing in the end.
         indices: [batch_size, seq_len]
         """
 
         batch_size, seq_len, embed_dim = x.size()
         visible_len = int(seq_len * (1 - mask_ratio))
-        visible_indices = indices[:, :visible_len]
+        invisible_len = seq_len - visible_len
+        tail_len = int(seq_len * left_ratio)
+        mask_start_index = visible_len - tail_len
+        mask_end_index = mask_start_index + invisible_len
+
+        visible_indices_mask = torch.ones(seq_len, dtype=torch.bool)
+        visible_indices_mask[mask_start_index:mask_end_index] = False
+        # visible_indices_mask: [seq_len]
+        visible_indices = indices[:, visible_indices_mask]
         # visible_indices: [batch_size, seq_len * mask_ratio]
         expand_visible_indices = visible_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
         # expand_visible_indices: [batch_size, seq_len * mask_ratio, embed_dim]
@@ -206,6 +215,14 @@ class MaskedPosReconCLRViT(nn.Module):
         # x_masked: [batch_size, seq_len * mask_ratio, embed_dim]
 
         return x_masked, expand_visible_indices
+
+    def first_k_mask(self, x, mask_ratio, indices):
+        """
+        Leave first $k = seq_len * (1 - mask_ratio)$ elements after masking
+        indices: [batch_size, seq_len]
+        """
+
+        return self.mask_interval(x, mask_ratio, 0., indices)
 
     def rand_mask(self, x, mask_ratio):
         batch_size, seq_len, embed_dim = x.size()
@@ -237,7 +254,7 @@ class MaskedPosReconCLRViT(nn.Module):
 
         return attention_weight
 
-    def attn_mask(self, x, mask_ratio):
+    def attn_mask(self, x, mask_ratio, hint_ratio):
         attn_weight = self.pay_attention(x)
         # attn_weight: [batch_size, num_heads, 1+seq_len, 1+seq_len]
         cls_attn_weight = attn_weight[:, :, 0, 1:]
@@ -246,9 +263,9 @@ class MaskedPosReconCLRViT(nn.Module):
         # cls_attn_head_avg_weight: [batch_size, seq_len]
         attn_ranked_indices = cls_attn_head_avg_weight.argsort()
 
-        return self.first_k_mask(x, mask_ratio, attn_ranked_indices)
+        return self.mask_interval(x, mask_ratio, hint_ratio, attn_ranked_indices)
 
-    def forward_encoder(self, x, position, shuffle, mask_ratio, attn_mask):
+    def forward_encoder(self, x, position, shuffle, mask_ratio, attn_mask, hint_ratio):
         x = self.patch_embed(x)
 
         if position:
@@ -263,7 +280,7 @@ class MaskedPosReconCLRViT(nn.Module):
             visible_indices = None
         else:
             if attn_mask:
-                x, visible_indices = self.attn_mask(x, mask_ratio)
+                x, visible_indices = self.attn_mask(x, mask_ratio, hint_ratio)
             else:
                 x, visible_indices = self.rand_mask(x, mask_ratio)
         # batch_size*2, seq_len * mask_ratio, embed_dim
@@ -312,11 +329,11 @@ class MaskedPosReconCLRViT(nn.Module):
         loss_clr = info_nce_loss(features, temp)
         return loss_recon, loss_clr
 
-    def forward(self, img, position=True, shuffle=True,
-                mask_ratio=0.75, attn_mask=False, temp=0.01):
+    def forward(self, img, position=True, shuffle=True, mask_ratio=0.75,
+                attn_mask=False, hint_ratio=0., temp=0.01):
         # img: [batch_size*2, in_chans, height, weight]
         latent, vis_ids = self.forward_encoder(
-            img, position, shuffle, mask_ratio, attn_mask
+            img, position, shuffle, mask_ratio, attn_mask, hint_ratio
         )
         # latent: [batch_size*2, 1 + seq_len * mask_ratio, embed_dim]
         pos_pred = self.forward_pos_decoder(latent[:, 1:, :])
