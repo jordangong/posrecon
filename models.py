@@ -3,7 +3,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 from pl_bolts.models.self_supervised.resnets import Bottleneck, ResNet
-from timm.models.vision_transformer import PatchEmbed, Block
+from timm.models.vision_transformer import PatchEmbed, Block, Attention
 from torch import nn
 
 from utils.pos_embed import get_2d_sincos_pos_embed
@@ -66,6 +66,56 @@ class SimCLRResNet(nn.Module):
         return embed, torch.zeros_like(embed), feat, 0, loss
 
 
+class AttentionWithWeightOutput(Attention):
+
+    def forward(self, x, weight_output=False):
+        batch_size, seq_len, embed_dim = x.size()
+        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.num_heads,
+                                  embed_dim // self.num_heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        # q, k, v: [batch_size, num_heads, 1+seq_len, embed_dim // num_heads]
+
+        attn_weight = (q @ k.transpose(-2, -1)) * self.scale
+        attn_weight = attn_weight.softmax(dim=-1)
+        # attn_weight: [batch_size, num_heads, 1+seq_len, 1+seq_len]
+
+        x = (self.attn_drop(attn_weight) @ v).transpose(1, 2)
+        x = x.reshape(batch_size, seq_len, embed_dim)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return (x, attn_weight) if weight_output else (x, None)
+
+
+class BlockWithAttentionWeight(Block):
+
+    def __init__(
+            self,
+            dim,
+            num_heads,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            drop=0.,
+            attn_drop=0.,
+            *args,
+            **kwargs
+    ):
+        super().__init__(dim, num_heads, mlp_ratio, qkv_bias,
+                         drop, attn_drop, *args, **kwargs)
+        self.attn = AttentionWithWeightOutput(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias,
+            attn_drop=attn_drop, proj_drop=drop
+        )
+
+    def forward(self, x, attention_weight=False):
+        x, attn_weight = self.attn(self.norm1(x), attention_weight)
+        x = x + self.drop_path1(self.ls1(x))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+
+        # Use dynamic return type here to make sequential module easier
+        return (x, attn_weight) if attention_weight else x
+
+
 class MaskedPosReconCLRViT(nn.Module):
     """
     Masked contrastive learning Vision Transformer w/ positional reconstruction
@@ -118,7 +168,7 @@ class MaskedPosReconCLRViT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim),
                                       requires_grad=False)
 
-        self.blocks = nn.Sequential(*[Block(
+        self.blocks = nn.Sequential(*[BlockWithAttentionWeight(
             embed_dim, encoder_num_heads, mlp_ratio, qkv_bias=True,
             drop=drop_rate, attn_drop=attention_drop_rate, drop_path=dpr.item(),
             norm_layer=norm_layer
@@ -254,16 +304,21 @@ class MaskedPosReconCLRViT(nn.Module):
 
         return attention_weight
 
-    def attn_mask(self, x, mask_ratio, hint_ratio):
-        attn_weight = self.pay_attention(x)
-        # attn_weight: [batch_size, num_heads, 1+seq_len, 1+seq_len]
+    def attn_mask(self, x, attn_weight, mask_ratio, hint_ratio):
         cls_attn_weight = attn_weight[:, :, 0, 1:]
         # cls_attn_weight: [batch_size, num_heads, seq_len]
         cls_attn_head_avg_weight = cls_attn_weight.mean(1)
         # cls_attn_head_avg_weight: [batch_size, seq_len]
         attn_ranked_indices = cls_attn_head_avg_weight.argsort()
 
-        return self.mask_interval(x, mask_ratio, hint_ratio, attn_ranked_indices)
+        # Don't mask [CLS] token
+        batch_cls_tokens = x[:, 0:1, :]
+        x, visible_indices = self.mask_interval(
+            x[:, 1:, :], mask_ratio, hint_ratio, attn_ranked_indices
+        )
+        x = torch.cat((batch_cls_tokens, x), dim=1)
+
+        return x, visible_indices
 
     def forward_encoder(self, x, position, shuffle, mask_ratio, attn_mask, hint_ratio):
         x = self.patch_embed(x)
@@ -275,14 +330,10 @@ class MaskedPosReconCLRViT(nn.Module):
                 x += self.pos_embed
         # batch_size*2, seq_len, embed_dim
 
-        if mask_ratio == 0:
-            # make `visible_indices` empty when all patches are visible
-            visible_indices = None
-        else:
-            if attn_mask:
-                x, visible_indices = self.attn_mask(x, mask_ratio, hint_ratio)
-            else:
-                x, visible_indices = self.rand_mask(x, mask_ratio)
+        # make `visible_indices` empty when all patches are visible
+        visible_indices = None
+        if mask_ratio > 0 and not attn_mask:
+            x, visible_indices = self.rand_mask(x, mask_ratio)
         # batch_size*2, seq_len * mask_ratio, embed_dim
 
         # Concatenate [CLS] tokens w/o pos_embed
@@ -290,7 +341,15 @@ class MaskedPosReconCLRViT(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         # batch_size*2, 1 + seq_len * mask_ratio, embed_dim
 
-        x = self.blocks(x)
+        # Single-pass forward, retrieve attention weight when using attn-mask
+        if mask_ratio > 0 and attn_mask:
+            # Mask the output tokens instead of patch embeddings
+            x = self.blocks[:-1](x)
+            x, attn_weight = self.blocks[-1](x, attention_weight=True)
+            x, visible_indices = self.attn_mask(x, attn_weight, mask_ratio, hint_ratio)
+        else:
+            x = self.blocks(x)
+
         x = self.norm(x)
 
         return x, visible_indices
