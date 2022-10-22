@@ -254,18 +254,21 @@ class MaskedPosReconCLRViT(nn.Module):
 
         return attention_weight
 
-    def attn_mask(self, x, mask_ratio, hint_ratio):
+    def attn_mask(self, x, mask_ratio, hint_ratio, attn_mask_mode):
         attn_weight = self.pay_attention(x)
         # attn_weight: [batch_size, num_heads, 1+seq_len, 1+seq_len]
         cls_attn_weight = attn_weight[:, :, 0, 1:]
         # cls_attn_weight: [batch_size, num_heads, seq_len]
         cls_attn_head_avg_weight = cls_attn_weight.mean(1)
         # cls_attn_head_avg_weight: [batch_size, seq_len]
-        attn_ranked_indices = cls_attn_head_avg_weight.argsort()
+        attn_ranked_indices = cls_attn_head_avg_weight.argsort(
+            descending=(attn_mask_mode == 'low')
+        )
 
         return self.mask_interval(x, mask_ratio, hint_ratio, attn_ranked_indices)
 
-    def forward_encoder(self, x, position, shuffle, mask_ratio, attn_mask, hint_ratio):
+    def forward_encoder(self, x, position, shuffle,
+                        mask_ratio, attn_mask, attn_mask_mode, hint_ratio):
         x = self.patch_embed(x)
 
         if position:
@@ -280,7 +283,8 @@ class MaskedPosReconCLRViT(nn.Module):
             visible_indices = None
         else:
             if attn_mask:
-                x, visible_indices = self.attn_mask(x, mask_ratio, hint_ratio)
+                x, visible_indices = self.attn_mask(x, mask_ratio, hint_ratio,
+                                                    attn_mask_mode)
             else:
                 x, visible_indices = self.rand_mask(x, mask_ratio)
         # batch_size*2, seq_len * mask_ratio, embed_dim
@@ -330,10 +334,11 @@ class MaskedPosReconCLRViT(nn.Module):
         return loss_recon, loss_clr
 
     def forward(self, img, position=True, shuffle=True, mask_ratio=0.75,
-                attn_mask=False, hint_ratio=0., temp=0.01):
+                attn_mask=False, attn_mask_mode='high', hint_ratio=0., temp=0.01):
         # img: [batch_size*2, in_chans, height, weight]
         latent, vis_ids = self.forward_encoder(
-            img, position, shuffle, mask_ratio, attn_mask, hint_ratio
+            img, position, shuffle,
+            mask_ratio, attn_mask, attn_mask_mode, hint_ratio,
         )
         # latent: [batch_size*2, 1 + seq_len * mask_ratio, embed_dim]
         pos_pred = self.forward_pos_decoder(latent[:, 1:, :])
