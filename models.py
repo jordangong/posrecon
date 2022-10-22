@@ -62,6 +62,9 @@ class SimCLRResNet(nn.Module):
             position=True,
             shuffle=True,
             mask_ratio=0.75,
+            attn_mask=False,
+            attn_mask_mode='high',
+            hint_ratio=0.,
             temp=0.01,
             pretrain=True,
     ):
