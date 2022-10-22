@@ -11,6 +11,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 
 from models import MaskedPosReconCLRViT, SimCLRResNet
+from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
 
@@ -259,6 +260,8 @@ class PosReconCLR(LightningModule):
                             help="dataset")
         parser.add_argument("--data_dir", type=str, default="dataset",
                             help="path to dataset")
+        parser.add_argument("--sample_pct", type=int, default=100,
+                            help="%% of samples for training (only for ablation)")
         parser.add_argument("--gaussian_blur", default=True,
                             action=BooleanOptionalAction, help="add gaussian blur")
         parser.add_argument("--jitter_strength", type=float, default=1.0,
@@ -325,9 +328,15 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
-        dm = ImagenetDataModule(data_dir=args.data_dir,
-                                batch_size=args.batch_size,
-                                num_workers=args.num_workers)
+        if args.sample_pct < 100:
+            dm = FewShotImagenetDataModule(args.sample_pct,
+                                           data_dir=args.data_dir,
+                                           batch_size=args.batch_size,
+                                           num_workers=args.num_workers)
+        else:
+            dm = ImagenetDataModule(data_dir=args.data_dir,
+                                    batch_size=args.batch_size,
+                                    num_workers=args.num_workers)
         args.num_samples = dm.num_samples
     else:
         raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
