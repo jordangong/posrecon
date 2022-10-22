@@ -107,6 +107,7 @@ class PosReconCLR(LightningModule):
 
         if dataset == "imagenet":
             normalization = imagenet_normalization()
+        self.normalization = normalization
         self.transform = SimCLRPretrainPostTransform(
             img_size=img_size,
             gaussian_blur=gaussian_blur,
@@ -138,6 +139,12 @@ class PosReconCLR(LightningModule):
         # compute iters per epoch
         global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
         self.train_iters_per_epoch = num_samples // global_batch_size
+
+    def forward(self, x, position=True):
+        x = self.normalization(x)
+        x = self.model(x, position, pretrain=False)
+
+        return x
 
     def shared_step(self, batch):
         img, _ = batch

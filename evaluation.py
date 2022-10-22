@@ -91,6 +91,7 @@ class PosReconCLREval(SSLFineTuner):
             normalization = flower102_normalization()
         elif dataset == "oxford_iiit_pet":
             normalization = oxford_iiit_pet_normalization()
+        self.normalization = normalization
         self.train_transform = SimCLRFinetuneTransform(
             img_size=img_size,
             normalize=normalization,
@@ -108,35 +109,19 @@ class PosReconCLREval(SSLFineTuner):
         elif self.protocol == 'finetune':
             self.backbone.train()
 
-    def forward_resnet(self, x):
-        return self.backbone.encoder(x)[0]
+    def forward(self, x, position=True):
+        x = self.normalization(x)
+        x = self.backbone(x, position, pretrain=False)
 
-    def forward_vit(self, x, position=True):
-        x = self.backbone.patch_embed(x)
-        if position:
-            x += self.backbone.pos_embed
-
-        cls_tokens = self.backbone.cls_token.expand(x.size(0), -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-
-        x = self.backbone.blocks(x)
-        x = self.backbone.norm(x)
-
-        return x[:, 0, :]
-
-    def forward_backbone(self, x):
-        if isinstance(self.backbone, MaskedPosReconCLRViT):
-            return self.forward_vit(x, self.position)
-        else:
-            return self.forward_resnet(x)
+        return x
 
     def shared_step(self, batch):
         x, y = batch
         if self.protocol == 'linear':
             with torch.no_grad():
-                feats = self.forward_backbone(x)
+                feats = self.backbone(x, self.position, pretrain=False)
         elif self.protocol == 'finetune':
-            feats = self.forward_backbone(x)
+            feats = self.backbone(x, self.position, pretrain=False)
 
         logits = self.linear_layer(feats)
         loss = self.criterion(logits, y)

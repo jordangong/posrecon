@@ -56,9 +56,19 @@ class SimCLRResNet(nn.Module):
             nn.Linear(embed_dim, proj_dim),
         )
 
-    def forward(self, img, position=True, shuffle=True, mask_ratio=0.75, temp=0.01):
-        # img: [batch_size*2, in_chans, height, weight]
+    def forward(
+            self,
+            img,
+            position=True,
+            shuffle=True,
+            mask_ratio=0.75,
+            temp=0.01,
+            pretrain=True,
+    ):
+        # img: [batch_size(*2), in_chans, height, weight]
         embed = self.encoder(img)[0]
+        if not pretrain:
+            return embed
         # embed: [batch_size*2, embed_dim]
         feat = self.proj_head(embed)
         # reps: [batch_size*2, proj_dim]
@@ -267,8 +277,8 @@ class MaskedPosReconCLRViT(nn.Module):
 
         return self.mask_interval(x, mask_ratio, hint_ratio, attn_ranked_indices)
 
-    def forward_encoder(self, x, position, shuffle,
-                        mask_ratio, attn_mask, attn_mask_mode, hint_ratio):
+    def forward_encoder(self, x, position, shuffle=False, mask_ratio=0.,
+                        attn_mask=False, attn_mask_mode='high', hint_ratio=0.):
         x = self.patch_embed(x)
 
         if position:
@@ -333,20 +343,35 @@ class MaskedPosReconCLRViT(nn.Module):
         loss_clr = info_nce_loss(features, temp)
         return loss_recon, loss_clr
 
-    def forward(self, img, position=True, shuffle=True, mask_ratio=0.75,
-                attn_mask=False, attn_mask_mode='high', hint_ratio=0., temp=0.01):
+    def forward(
+            self,
+            img,
+            position=True,
+            shuffle=True,
+            mask_ratio=0.75,
+            attn_mask=False,
+            attn_mask_mode='high',
+            hint_ratio=0.,
+            temp=0.01,
+            pretrain=True,
+    ):
         # img: [batch_size*2, in_chans, height, weight]
-        latent, vis_ids = self.forward_encoder(
-            img, position, shuffle,
-            mask_ratio, attn_mask, attn_mask_mode, hint_ratio,
-        )
-        # latent: [batch_size*2, 1 + seq_len * mask_ratio, embed_dim]
-        pos_pred = self.forward_pos_decoder(latent[:, 1:, :])
-        # pos_pred: [batch_size*2, seq_len * mask_ratio, embed_dim]
-        feat = self.proj_head(latent[:, 0, :])
-        # reps: [batch_size*2, proj_dim]
-        loss_recon, loss_clr = self.forward_loss(pos_pred, vis_ids, feat, temp)
-        return latent, pos_pred, feat, loss_recon, loss_clr
+        if pretrain:
+            latent, vis_ids = self.forward_encoder(
+                img, position, shuffle,
+                mask_ratio, attn_mask, attn_mask_mode, hint_ratio,
+            )
+            # latent: [batch_size*2, 1 + seq_len * mask_ratio, embed_dim]
+            pos_pred = self.forward_pos_decoder(latent[:, 1:, :])
+            # pos_pred: [batch_size*2, seq_len * mask_ratio, embed_dim]
+            feat = self.proj_head(latent[:, 0, :])
+            # reps: [batch_size*2, proj_dim]
+            loss_recon, loss_clr = self.forward_loss(pos_pred, vis_ids, feat, temp)
+            return latent, pos_pred, feat, loss_recon, loss_clr
+        else:
+            latent, _ = self.forward_encoder(img, position)
+            # latent: [batch_size, 1 + seq_len * mask_ratio, embed_dim]
+            return latent[:, 0, :]
 
 
 def info_nce_loss(features, temp, eps=1e-6):
