@@ -327,8 +327,8 @@ if __name__ == "__main__":
 
     if args.label_pct < 100:
         if args.dataset == "imagenet":
-            dm = FewShotImagenetDataModule(args.label_pct,
-                                           data_dir=args.data_dir,
+            dm = FewShotImagenetDataModule(args.data_dir,
+                                           label_pct=args.label_pct,
                                            batch_size=args.batch_size,
                                            num_workers=args.num_workers)
         else:

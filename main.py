@@ -3,6 +3,7 @@ from functools import partial
 
 import torch
 import torch_optimizer as optim
+from pl_bolts.callbacks.knn_online import KNNOnlineEvaluator
 from pl_bolts.datamodules import ImagenetDataModule
 from pl_bolts.optimizers import linear_warmup_decay
 from pytorch_lightning import Trainer, LightningModule
@@ -331,13 +332,15 @@ if __name__ == '__main__':
     parser.add_argument("--log_path", default="lightning_logs", type=str)
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, type=BooleanOptionalAction)
+    parser.add_argument("--knn_probe", default=True, type=BooleanOptionalAction)
     parser = PosReconCLR.add_model_specific_args(parser)
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
         if args.sample_pct < 100:
-            dm = FewShotImagenetDataModule(args.sample_pct,
-                                           data_dir=args.data_dir,
+            dm = FewShotImagenetDataModule(args.data_dir,
+                                           label_pct=args.sample_pct,
+                                           num_imgs_per_val_class=1,
                                            batch_size=args.batch_size,
                                            num_workers=args.num_workers)
         else:
@@ -355,7 +358,11 @@ if __name__ == '__main__':
     logger = TensorBoardLogger(args.log_path, name="pretrain", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")
     model_checkpoint = ModelCheckpoint(save_last=True, monitor="loss/pretrain/val")
-    callbacks = [model_checkpoint, lr_monitor]
+
+    callbacks = [model_checkpoint]
+    if args.knn_probe:
+        callbacks.append(KNNOnlineEvaluator())
+    callbacks.append(lr_monitor)
 
     trainer = Trainer(
         max_epochs=args.max_epochs,
