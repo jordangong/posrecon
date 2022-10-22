@@ -177,7 +177,7 @@ class SimCLRPretrainPostTransform(nn.Module):
             self.transform = K.AugmentationSequential(*data_transforms, normalize)
 
     @torch.no_grad()
-    def forward(self, x) -> tuple[Tensor, Tensor]:
+    def forward(self, x) -> Tensor:
         return self.transform(x)
 
 
