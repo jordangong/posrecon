@@ -1,3 +1,4 @@
+import copy
 from argparse import ArgumentParser, BooleanOptionalAction
 from functools import partial
 
@@ -11,7 +12,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 
-from models import MaskedPosReconCLRViT, SimCLRResNet
+from models import MaskedPosReconCLRViT, SimCLRResNet, info_nce_loss
 from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
@@ -46,7 +47,8 @@ class PosReconCLR(LightningModule):
             max_epochs: int = 100,
             position: bool = True,
             shuffle: bool = True,
-            mask_ratio: float = 0.75,
+            online_mask_ratio: float = 0.75,
+            target_mask_ratio: float = 0.,
             attn_mask: bool = False,
             attn_mask_mode: str = 'high',
             hint_ratio: float = 0.,
@@ -55,6 +57,7 @@ class PosReconCLR(LightningModule):
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
+            ema_momentum: float = 0.99,
             weight_decay: float = 1e-6,
             layer_decay: float = 1.,
             **kwargs
@@ -95,7 +98,8 @@ class PosReconCLR(LightningModule):
         self.layer_decay = layer_decay
         self.position = position
         self.shuffle = shuffle
-        self.mask_ratio = mask_ratio
+        self.online_mask_ratio = online_mask_ratio
+        self.target_mask_ratio = target_mask_ratio
         self.attn_mask = attn_mask
         self.attn_mask_mode = attn_mask_mode
         self.hint_ratio = hint_ratio
@@ -105,6 +109,7 @@ class PosReconCLR(LightningModule):
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
+        self.ema_momentum = ema_momentum
 
         if dataset == "imagenet":
             normalization = imagenet_normalization()
@@ -116,7 +121,7 @@ class PosReconCLR(LightningModule):
             normalize=normalization,
         )
 
-        self.model = MaskedPosReconCLRViT(
+        self.online_net = MaskedPosReconCLRViT(
             img_size,
             patch_size,
             in_chans,
@@ -136,23 +141,48 @@ class PosReconCLR(LightningModule):
             embed_dim=embed_dim,
             proj_dim=proj_dim,
         )
+        self.target_net = copy.deepcopy(self.online_net)
 
         # compute iters per epoch
         global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
         self.train_iters_per_epoch = num_samples // global_batch_size
 
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        for online_p, target_p in zip(self.online_net.parameters(),
+                                      self.target_net.parameters()):
+            em = self.ema_momentum
+            target_p.data = target_p.data * em + online_p.data * (1.0 - em)
+
     def forward(self, x, position=True):
         x = self.normalization(x)
-        x = self.model(x, position, pretrain=False)
+        x = self.online_net(x, position, pretrain=False)
 
         return x
 
     def shared_step(self, batch):
         img, _ = batch
         img = self.transform(torch.cat(img))
-        return self.model(img, self.position, self.shuffle, self.mask_ratio,
-                          self.attn_mask, self.attn_mask_mode, self.hint_ratio,
-                          self.temperature)
+
+        latent, pos_pred, vis_ids, proj_online = self.online_net(
+            img, self.position, self.shuffle, self.online_mask_ratio,
+            self.attn_mask, self.attn_mask_mode, self.hint_ratio
+        )
+        with torch.no_grad():
+            proj_target = self.target_net(
+                img, self.position, False, self.target_mask_ratio,
+                self.attn_mask, self.attn_mask_mode, self.hint_ratio,
+                target_network=True,
+            )
+
+        loss_recon = self.online_net.pos_recon_loss(pos_pred, vis_ids)
+
+        proj1_online, proj2_online = proj_online.chunk(2)
+        proj1_target, proj2_target = proj_target.chunk(2)
+        loss_clr1 = info_nce_loss(proj1_online, proj2_target, self.temperature)
+        loss_clr2 = info_nce_loss(proj2_online, proj1_target, self.temperature)
+        loss_clr = (loss_clr1 + loss_clr2) / 2
+
+        return latent, pos_pred, (proj_online, proj_target), loss_recon, loss_clr
 
     def training_step(self, batch, batch_idx):
         latent, pos_embed_pred, proj_embed, loss_recon, loss_clr = self.shared_step(batch)
@@ -164,7 +194,8 @@ class PosReconCLR(LightningModule):
             'loss/clr/train': loss_clr,
             'norm/latent': latent.norm(dim=-1).mean(),
             'norm/pos_embed_pred': pos_embed_pred.norm(dim=-1).mean(),
-            'norm/proj_embed': proj_embed.norm(dim=-1).mean(),
+            'norm/proj_embed_online': proj_embed[0].norm(dim=-1).mean(),
+            'norm/proj_embed_target': proj_embed[1].norm(dim=-1).mean(),
         }, sync_dist=True)
         return loss
 
@@ -182,7 +213,7 @@ class PosReconCLR(LightningModule):
     def configure_optimizers(self):
         if self.backbone == "vit":
             param_groups = param_groups_lrd(
-                self.model,
+                self.online_net,
                 lr=self.learning_rate,
                 weight_decay=self.weight_decay,
                 exclude_1d_params=self.exclude_bn_bias,
@@ -192,12 +223,12 @@ class PosReconCLR(LightningModule):
         else:
             if self.exclude_bn_bias:
                 param_groups = exclude_from_wt_decay(
-                    self.model,
+                    self.online_net,
                     self.weight_decay
                 )
             else:
                 param_groups = {
-                    "params": self.model.parameters(),
+                    "params": self.online_net.parameters(),
                     "weight_decay": self.weight_decay
                 }
 
@@ -294,6 +325,8 @@ class PosReconCLR(LightningModule):
                             help="max steps")
         parser.add_argument("--warmup_epochs", default=10, type=int,
                             help="number of warmup epochs")
+        parser.add_argument("--ema_momentum", default=0.99, type=float,
+                            help="ema momentum")
         parser.add_argument("--batch_size", default=128, type=int,
                             help="batch size per gpu")
 
@@ -301,8 +334,10 @@ class PosReconCLR(LightningModule):
                             help="add positional embedding or not")
         parser.add_argument("--shuffle", default=True, action=BooleanOptionalAction,
                             help="shuffle patches or not")
-        parser.add_argument("--mask_ratio", default=0.75, type=float,
-                            help="mask ratio of patches")
+        parser.add_argument("--online_mask_ratio", default=0.75, type=float,
+                            help="online network mask ratio of patches")
+        parser.add_argument("--target_mask_ratio", default=0., type=float,
+                            help="target network mask ratio of patches")
         parser.add_argument("--attn_mask", default=False, action='store_true',
                             help="mask patches guided by attention")
         parser.add_argument("--attn_mask_mode", default='high', type=str,

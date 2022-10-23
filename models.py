@@ -62,18 +62,20 @@ class SimCLRResNet(nn.Module):
             position=True,
             shuffle=True,
             mask_ratio=0.75,
-            temp=0.01,
             pretrain=True,
+            target_network=False,
     ):
         # img: [batch_size(*2), in_chans, height, weight]
         embed = self.encoder(img)[0]
         if not pretrain:
             return embed
         # embed: [batch_size*2, embed_dim]
-        feat = self.proj_head(embed)
-        # reps: [batch_size*2, proj_dim]
-        loss = info_nce_loss(feat, temp)
-        return embed, torch.zeros_like(embed), feat, 0, loss
+        proj = self.proj_head(embed)
+        # proj: [batch_size*2, proj_dim]
+        if target_network:
+            return proj
+        else:
+            return embed, torch.zeros_like(embed), None, proj
 
 
 class MaskedPosReconCLRViT(nn.Module):
@@ -136,9 +138,9 @@ class MaskedPosReconCLRViT(nn.Module):
         ])
         self.norm = norm_layer(embed_dim)
 
-        # Position predictor (linear layer equiv.)
+        # Position predictor
         if decoder_depth == 0:
-            self.pos_decoder = nn.Conv1d(embed_dim, embed_dim, kernel_size=1)
+            self.pos_decoder = nn.Linear(embed_dim, embed_dim)
         else:
             self.pos_decoder = nn.Sequential(*[Block(
                 embed_dim, decoder_num_heads, mlp_ratio,
@@ -309,18 +311,6 @@ class MaskedPosReconCLRViT(nn.Module):
 
         return x, visible_indices
 
-    def forward_pos_decoder(self, latent):
-        if isinstance(self.pos_decoder, nn.Conv1d):
-            # Exchange channel and length dimension for Conv1d
-            latent = latent.permute(0, 2, 1)
-            pos_embed_pred = self.pos_decoder(latent)
-            # Restore dimension
-            pos_embed_pred = pos_embed_pred.permute(0, 2, 1)
-        else:  # Transformer decoder
-            pos_embed_pred = self.pos_decoder(latent)
-
-        return pos_embed_pred
-
     def pos_recon_loss(self, batch_pos_embed_pred, vis_ids):
         batch_size = batch_pos_embed_pred.size(0)
         # self.pos_embed: [1, seq_len, embed_dim]
@@ -338,11 +328,6 @@ class MaskedPosReconCLRViT(nn.Module):
         loss = F.mse_loss(batch_pos_embed_pred, batch_pos_embed_targ)
         return loss
 
-    def forward_loss(self, batch_pos_embed_pred, vis_ids, features, temp=0.1):
-        loss_recon = self.pos_recon_loss(batch_pos_embed_pred, vis_ids)
-        loss_clr = info_nce_loss(features, temp)
-        return loss_recon, loss_clr
-
     def forward(
             self,
             img,
@@ -352,8 +337,8 @@ class MaskedPosReconCLRViT(nn.Module):
             attn_mask=False,
             attn_mask_mode='high',
             hint_ratio=0.,
-            temp=0.01,
             pretrain=True,
+            target_network=False,
     ):
         # img: [batch_size*2, in_chans, height, weight]
         if pretrain:
@@ -362,22 +347,29 @@ class MaskedPosReconCLRViT(nn.Module):
                 mask_ratio, attn_mask, attn_mask_mode, hint_ratio,
             )
             # latent: [batch_size*2, 1 + seq_len * mask_ratio, embed_dim]
-            pos_pred = self.forward_pos_decoder(latent[:, 1:, :])
+
+            proj = self.proj_head(latent[:, 0, :])
+            # proj: [batch_size*2, proj_dim]
+
+            if target_network:
+                return proj
+
+            pos_pred = self.pos_decoder(latent[:, 1:, :])
             # pos_pred: [batch_size*2, seq_len * mask_ratio, embed_dim]
-            feat = self.proj_head(latent[:, 0, :])
-            # reps: [batch_size*2, proj_dim]
-            loss_recon, loss_clr = self.forward_loss(pos_pred, vis_ids, feat, temp)
-            return latent, pos_pred, feat, loss_recon, loss_clr
+
+            return latent, pos_pred, vis_ids, proj
         else:
             latent, _ = self.forward_encoder(img, position)
             # latent: [batch_size, 1 + seq_len * mask_ratio, embed_dim]
+
             return latent[:, 0, :]
 
 
-def info_nce_loss(features, temp, eps=1e-6):
-    feat = F.normalize(features)
-    # feat: [batch_size*2, proj_dim]
-    feat = torch.stack(feat.chunk(2), dim=1)
+def info_nce_loss(feat1, feat2, temp, eps=1e-6):
+    feat1 = F.normalize(feat1)
+    feat2 = F.normalize(feat2)
+    # feat{1,2}: [batch_size, proj_dim]
+    feat = torch.stack((feat1, feat2), dim=1)
     # feat: [batch_size, 2, proj_dim]
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         feat = SyncFunction.apply(feat)

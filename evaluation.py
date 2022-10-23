@@ -305,9 +305,9 @@ if __name__ == "__main__":
 
     pretrained = PosReconCLR.load_from_checkpoint(args.ckpt_path, strict=False)
     # a bit hacky here, replace ViT with dropout rate
-    if isinstance(pretrained.model, MaskedPosReconCLRViT):
+    if isinstance(pretrained.online_net, MaskedPosReconCLRViT):
         pretained_state_dict = pretrained.state_dict()
-        pretrained.model = MaskedPosReconCLRViT(
+        pretrained.online_net = MaskedPosReconCLRViT(
             pretrained.img_size,
             pretrained.patch_size,
             pretrained.in_chans,
@@ -363,7 +363,7 @@ if __name__ == "__main__":
         dataset=args.dataset,
         img_size=pretrained.img_size,
         position=args.position,
-        backbone=pretrained.model,
+        backbone=pretrained.online_net,
         in_features=pretrained.embed_dim,
         num_classes=dm.num_classes,
         epochs=args.max_epochs,
