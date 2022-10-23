@@ -340,7 +340,6 @@ if __name__ == '__main__':
         if args.sample_pct < 100:
             dm = FewShotImagenetDataModule(args.data_dir,
                                            label_pct=args.sample_pct,
-                                           num_imgs_per_val_class=1,
                                            batch_size=args.batch_size,
                                            num_workers=args.num_workers)
         else:
