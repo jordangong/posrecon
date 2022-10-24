@@ -3,6 +3,7 @@ from argparse import ArgumentParser, BooleanOptionalAction
 from functools import partial
 
 import torch
+import torch.nn.functional as F
 import torch_optimizer as optim
 from pl_bolts.callbacks.knn_online import KNNOnlineEvaluator
 from pl_bolts.datamodules import ImagenetDataModule
@@ -12,13 +13,13 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 
-from models import MaskedPosReconCLRViT, SimCLRResNet, info_nce_loss
+from models import SimCLRViT, SyncFunction
 from utils.datamodules import FewShotImagenetDataModule
-from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
+from utils.lr_wt_decay import param_groups_lrd
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
 
 
-class PosReconCLR(LightningModule):
+class MuitiHeadAttnMaskCLR(LightningModule):
     def __init__(
             self,
             gpus: int,
@@ -26,18 +27,14 @@ class PosReconCLR(LightningModule):
             batch_size: int,
             num_nodes: int = 1,
             dataset: str = "imagenet",
-            backbone: str = "vit",
-            layers: tuple = (3, 4, 6, 3),
             gaussian_blur: bool = True,
             jitter_strength: float = 1.,
             img_size: int = 224,
             patch_size: int = 16,
             in_chans: int = 3,
             embed_dim: int = 768,
-            encoder_depth: int = 12,
-            encoder_num_heads: int = 12,
-            decoder_depth: int = 0,
-            decoder_num_heads: int = 12,
+            depth: int = 12,
+            num_heads: int = 12,
             mlp_ratio: int = 4,
             proj_dim: int = 128,
             drop_rate: float = 0.,
@@ -46,12 +43,7 @@ class PosReconCLR(LightningModule):
             warmup_epochs: int = 10,
             max_epochs: int = 100,
             position: bool = True,
-            shuffle: bool = True,
             online_mask_ratio: float = 0.75,
-            target_mask_ratio: float = 0.,
-            attn_mask: bool = False,
-            attn_mask_mode: str = 'high',
-            hint_ratio: float = 0.,
             temperature: float = 0.1,
             loss_ratio: float = 1.,
             optimizer: str = "adam",
@@ -62,7 +54,7 @@ class PosReconCLR(LightningModule):
             layer_decay: float = 1.,
             **kwargs
     ):
-        super(PosReconCLR, self).__init__()
+        super(MuitiHeadAttnMaskCLR, self).__init__()
         self.save_hyperparameters()
 
         self.gpus = gpus
@@ -72,20 +64,14 @@ class PosReconCLR(LightningModule):
         self.jitter_strength = jitter_strength
         self.num_samples = num_samples
         self.batch_size = batch_size
-        self.backbone = backbone
-
-        # ResNet params
-        self.layers = layers
 
         # ViT params
         self.img_size = img_size
         self.patch_size = patch_size
         self.in_chans = in_chans
         self.embed_dim = embed_dim
-        self.encoder_depth = encoder_depth
-        self.encoder_num_heads = encoder_num_heads
-        self.decoder_depth = decoder_depth
-        self.decoder_num_heads = decoder_num_heads
+        self.depth = depth
+        self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
         self.proj_dim = proj_dim
         self.drop_rate = drop_rate
@@ -97,12 +83,7 @@ class PosReconCLR(LightningModule):
         self.weight_decay = weight_decay
         self.layer_decay = layer_decay
         self.position = position
-        self.shuffle = shuffle
         self.online_mask_ratio = online_mask_ratio
-        self.target_mask_ratio = target_mask_ratio
-        self.attn_mask = attn_mask
-        self.attn_mask_mode = attn_mask_mode
-        self.hint_ratio = hint_ratio
         self.temperature = temperature
         self.loss_ratio = loss_ratio
 
@@ -121,25 +102,19 @@ class PosReconCLR(LightningModule):
             normalize=normalization,
         )
 
-        self.online_net = MaskedPosReconCLRViT(
+        self.online_net = SimCLRViT(
             img_size,
             patch_size,
             in_chans,
             embed_dim,
-            encoder_depth,
-            encoder_num_heads,
-            decoder_depth,
-            decoder_num_heads,
+            depth,
+            num_heads,
             mlp_ratio,
             proj_dim,
             drop_rate,
             attention_drop_rate,
             drop_path_rate,
             partial(nn.LayerNorm, eps=1e-6),
-        ) if backbone == "vit" else SimCLRResNet(
-            layers=layers,
-            embed_dim=embed_dim,
-            proj_dim=proj_dim,
         )
         self.target_net = copy.deepcopy(self.online_net)
 
@@ -155,82 +130,171 @@ class PosReconCLR(LightningModule):
 
     def forward(self, x, position=True):
         x = self.normalization(x)
-        x = self.online_net(x, position, pretrain=False)
+        x, *_ = self.online_net(x, position)
 
-        return x
+        return x[:, 0, :]
+
+    @staticmethod
+    def multi_head_attn_mask(patch_embed, attn_weight, mask_ratio):
+        """
+        Multi-head attention-guided masking
+        Args:
+            patch_embed: [batch_size * (num_heads + 1), seq_len, embed_dim]
+            attn_weight: [batch_size, num_heads, 1 + seq_len, 1 + seq_len]
+            mask_ratio: ratio of # of masked patches to # of patches
+        return:
+            masked_patch_embed: [batch_size * (num_heads + 1),
+                                 seq_len * (1 - mask_ratio), embed_dim]
+        """
+        _, seq_len, embed_dim = patch_embed.size()
+
+        cls_attn_weight = attn_weight[:, :, 0, 1:]
+        # cls_attn_weight: [batch_size, num_heads, seq_len]
+        cls_attn_head_avg_weight = cls_attn_weight.mean(1)
+        # cls_attn_head_avg_weight: [batch_size, seq_len]
+        cls_attn_weight = torch.cat((cls_attn_weight.view(-1, seq_len),
+                                     cls_attn_head_avg_weight))
+        # cls_attn_weight: [batch_size * (num_heads + 1), seq_len]
+        attn_ranked_indices = cls_attn_weight.argsort(descending=True)
+
+        visible_len = int(seq_len * (1 - mask_ratio))
+        visible_indices = attn_ranked_indices[:, :visible_len]
+        # visible_indices: [batch_size * (num_heads + 1), seq_len * mask_ratio]
+        expand_visible_indices = visible_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
+        # expand_visible_indices: [batch_size * (num_heads + 1), seq_len * (1 - mask_ratio), embed_dim]
+        masked_patch_embed = patch_embed.gather(1, expand_visible_indices)
+        # masked_patch_embed: [batch_size * (num_heads + 1), seq_len * (1 - mask_ratio), embed_dim]
+
+        return masked_patch_embed
+
+    @staticmethod
+    def instance_contrast_loss(proj_online, proj_target, temp):
+        # Instance-level contrast
+        # positive pairs: mean attention masked and target
+        # proj_online: [batch_size, num_heads + 1, proj_dim]
+        # proj_target: [batch_size, proj_dim]
+        feat = torch.cat((proj_online, proj_target.unsqueeze(1)), dim=1)
+        # feat: [batch_size, num_heads + 2, proj_dim]
+        all_sim = (feat @ feat.transpose(1, 2))
+        all_sim.diagonal(dim1=-2, dim2=-1).fill_(0)
+        # all_sim: [batch_size, num_heads + 2, num_heads + 2]
+        all_ = torch.exp(all_sim / temp).sum(dim=(-2, -1))
+        # all_: [batch_size]
+        pos_sim = (proj_online[:, -1:] @ proj_target.unsqueeze(-1)).squeeze()
+        # pos_sim: [batch_size]
+        pos = torch.exp(pos_sim / temp) * 2
+        loss = -torch.log(pos / all_).mean()
+
+        return loss, all_sim
+
+    @staticmethod
+    def batch_contrast_loss(proj_online, proj_target, sim_instance, temp):
+        # Batch-level contrast
+        # positive pairs: all instance-level pairs
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            proj_online = SyncFunction.apply(proj_online)
+            proj_target = SyncFunction.apply(proj_target)
+            sim_instance = SyncFunction.apply(sim_instance)
+        # proj_online: [batch_size*2 (* world_size), num_heads + 1, proj_dim]
+        # proj_target: [batch_size*2 (* world_size), proj_dim]
+        # sim_instance: [batch_size*2 (* world_size), num_heads + 2, num_heads + 2]
+        *_, proj_dim = proj_online.size()
+        feat = torch.cat((proj_online.view(-1, proj_dim), proj_target))
+        # feat: [batch_size*2 (* world_size) * (num_heads+2), proj_dim]
+        all_sim = (feat @ feat.T).fill_diagonal_(0)
+        # feat: [batch_size*2 (* world_size) * (num_heads+2), ...]
+        all_ = torch.exp(all_sim / temp).sum(-1)
+        pos = torch.exp(sim_instance / temp).sum(dim=-1).view(-1)
+        loss = -torch.log(pos / all_).mean()
+
+        return loss
 
     def shared_step(self, batch):
-        img, _ = batch
-        img = self.transform(torch.cat(img))
+        (crop1, crop2), _ = batch
+        batch_size, *img_dim = crop1.size()
+        crops = torch.stack((crop1, crop2))
+        # crops: [2, batch_size, in_chans, height, width]
+        num_masks = self.num_heads + 1  # Last one for attention mean
+        #                                             another one for target
+        crops = crops.unsqueeze(2).expand(-1, -1, num_masks + 1, *img_dim)
+        # crops: [2, batch_size, num_heads+2, in_chans, height, width]
+        img = self.transform(crops.reshape(-1, *img_dim)).view_as(crops)
+        # img: [2, batch_size, num_heads+2, in_chans, height, width]
 
-        latent, pos_pred, vis_ids, proj_online = self.online_net(
-            img, self.position, self.shuffle, self.online_mask_ratio,
-            self.attn_mask, self.attn_mask_mode, self.hint_ratio
-        )
+        # To fetch attention weight, forward target net first
+        img_target = img[:, :, 0].reshape(-1, *img_dim)
         with torch.no_grad():
-            proj_target = self.target_net(
-                img, self.position, False, self.target_mask_ratio,
-                self.attn_mask, self.attn_mask_mode, self.hint_ratio,
-                target_network=True,
-            )
+            _, proj_target, attn_weight = self.target_net(img_target, self.position)
 
-        loss_recon = self.online_net.pos_recon_loss(pos_pred, vis_ids)
+        # To mask on embedding-level, manually forward online encoder
+        img_online = img[:, :, 1:].reshape(-1, *img_dim)
+        patch_embed = self.online_net.pre_encode(img_online, self.position)
+        masked_patch_embed = self.multi_head_attn_mask(
+            patch_embed, attn_weight, self.online_mask_ratio
+        )
+        latent, _ = self.online_net.forward_encoder(masked_patch_embed)
+        proj_online = self.online_net.proj_head(latent[:, 0, :])
 
+        # Normalize and reshape for loss calculation
+        proj_target, proj_online = F.normalize(proj_target), F.normalize(proj_online)
+        proj_online = proj_online.view(-1, self.num_heads + 1, self.proj_dim)
         proj1_online, proj2_online = proj_online.chunk(2)
         proj1_target, proj2_target = proj_target.chunk(2)
-        loss_clr1 = info_nce_loss(proj1_online, proj2_target, self.temperature)
-        loss_clr2 = info_nce_loss(proj2_online, proj1_target, self.temperature)
-        loss_clr = (loss_clr1 + loss_clr2) / 2
 
-        return latent, pos_pred, (proj_online, proj_target), loss_recon, loss_clr
+        # Instance-level loss
+        loss_instance_clr1, sim_instance1 = self.instance_contrast_loss(
+            proj1_online, proj2_target, self.temperature
+        )
+        loss_instance_clr2, sim_instance2 = self.instance_contrast_loss(
+            proj2_online, proj1_target, self.temperature
+        )
+        loss_instance_clr = (loss_instance_clr1 + loss_instance_clr2) / 2
+
+        # Batch-level loss
+        loss_batch_clr1 = self.batch_contrast_loss(
+            proj1_online, proj2_target, sim_instance1, self.temperature
+        )
+        loss_batch_clr2 = self.batch_contrast_loss(
+            proj2_online, proj1_target, sim_instance2, self.temperature
+        )
+        loss_batch_clr = (loss_batch_clr1 + loss_batch_clr2) / 2
+
+        return latent, (proj_online, proj_target), (loss_instance_clr, loss_batch_clr)
 
     def training_step(self, batch, batch_idx):
-        latent, pos_embed_pred, proj_embed, loss_recon, loss_clr = self.shared_step(batch)
-        loss = self.loss_ratio * loss_recon + loss_clr
+        latent, proj_embed, losses = self.shared_step(batch)
+        loss = self.loss_ratio * losses[0] + losses[1]
 
         self.log_dict({
             'loss/pretrain/train': loss,
-            'loss/recon/train': loss_recon,
-            'loss/clr/train': loss_clr,
+            'loss/instance/train': losses[0],
+            'loss/batch/train': losses[1],
             'norm/latent': latent.norm(dim=-1).mean(),
-            'norm/pos_embed_pred': pos_embed_pred.norm(dim=-1).mean(),
             'norm/proj_embed_online': proj_embed[0].norm(dim=-1).mean(),
             'norm/proj_embed_target': proj_embed[1].norm(dim=-1).mean(),
         }, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        *_, loss_recon, loss_clr = self.shared_step(batch)
-        loss = self.loss_ratio * loss_recon + loss_clr
+        *_, losses = self.shared_step(batch)
+        loss = self.loss_ratio * losses[0] + losses[1]
 
         self.log_dict({
             'loss/pretrain/val': loss,
-            'loss/recon/val': loss_recon,
-            'loss/clr/val': loss_clr,
+            'loss/instance/val': losses[0],
+            'loss/batch/val': losses[1],
         }, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
-        if self.backbone == "vit":
-            param_groups = param_groups_lrd(
-                self.online_net,
-                lr=self.learning_rate,
-                weight_decay=self.weight_decay,
-                exclude_1d_params=self.exclude_bn_bias,
-                no_weight_decay_list=("pos_embed", "cls_token"),
-                layer_decay=self.layer_decay
-            )
-        else:
-            if self.exclude_bn_bias:
-                param_groups = exclude_from_wt_decay(
-                    self.online_net,
-                    self.weight_decay
-                )
-            else:
-                param_groups = {
-                    "params": self.online_net.parameters(),
-                    "weight_decay": self.weight_decay
-                }
+        param_groups = param_groups_lrd(
+            self.online_net,
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+            exclude_1d_params=self.exclude_bn_bias,
+            no_weight_decay_list=("pos_embed", "cls_token"),
+            layer_decay=self.layer_decay
+        )
 
         if self.optim == "lars":
             optimizer = optim.LARS(param_groups, lr=self.learning_rate, momentum=0.9)
@@ -260,10 +324,6 @@ class PosReconCLR(LightningModule):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
 
         # model params
-        parser.add_argument("--backbone", default="vit", type=str,
-                            help="backbone (ViT or ResNet)")
-        parser.add_argument("--layers", default=(3, 4, 6, 3), nargs=4, type=int,
-                            help="number of ResNet layers in each block")
         parser.add_argument("--img_size", default=224, type=int,
                             help="input image size")
         parser.add_argument("--patch_size", default=16, type=int,
@@ -272,15 +332,10 @@ class PosReconCLR(LightningModule):
                             help="number of in channels")
         parser.add_argument("--embed_dim", default=768, type=int,
                             help="embedding dimension")
-        parser.add_argument("--encoder_depth", default=12, type=int,
-                            help="encoder number of Transformer blocks")
-        parser.add_argument("--encoder_num_heads", default=12, type=int,
-                            help="encoder number of self-attention heads")
-        parser.add_argument("--decoder_depth", default=0, type=int,
-                            help="decoder number of Transformer blocks, "
-                                 "set it to 0 for linear layer")
-        parser.add_argument("--decoder_num_heads", default=12, type=int,
-                            help="decoder number of self-attention heads")
+        parser.add_argument("--depth", default=12, type=int,
+                            help="number of Transformer blocks")
+        parser.add_argument("--num_heads", default=12, type=int,
+                            help="number of self-attention heads")
         parser.add_argument("--mlp_ratio", default=4, type=int,
                             help="Ratio of embedding dim to MLP dim")
         parser.add_argument("--proj_dim", default=128, type=int,
@@ -332,21 +387,8 @@ class PosReconCLR(LightningModule):
 
         parser.add_argument("--position", default=True, action=BooleanOptionalAction,
                             help="add positional embedding or not")
-        parser.add_argument("--shuffle", default=True, action=BooleanOptionalAction,
-                            help="shuffle patches or not")
         parser.add_argument("--online_mask_ratio", default=0.75, type=float,
                             help="online network mask ratio of patches")
-        parser.add_argument("--target_mask_ratio", default=0., type=float,
-                            help="target network mask ratio of patches")
-        parser.add_argument("--attn_mask", default=False, action='store_true',
-                            help="mask patches guided by attention")
-        parser.add_argument("--attn_mask_mode", default='high', type=str,
-                            help="attn-mask mode: "
-                                 "high for masking out high attention patches, "
-                                 "low for low attention patches")
-        parser.add_argument("--hint_ratio", default=0., type=float,
-                            help="attention hint ratio "
-                                 "(leave some high attention patches)")
         parser.add_argument("--temperature", default=0.1, type=float,
                             help="temperature parameter in InfoNCE loss")
         parser.add_argument("--loss_ratio", default=1., type=float,
@@ -368,7 +410,7 @@ if __name__ == '__main__':
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, type=BooleanOptionalAction)
     parser.add_argument("--knn_probe", default=True, type=BooleanOptionalAction)
-    parser = PosReconCLR.add_model_specific_args(parser)
+    parser = MuitiHeadAttnMaskCLR.add_model_specific_args(parser)
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
@@ -387,7 +429,7 @@ if __name__ == '__main__':
 
     dm.train_transforms = dm.val_transforms = SimCLRPretrainPreTransform(args.img_size)
 
-    model = PosReconCLR(**args.__dict__)
+    model = MuitiHeadAttnMaskCLR(**args.__dict__)
 
     logger = TensorBoardLogger(args.log_path, name="pretrain", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")

@@ -12,6 +12,7 @@ class SimCLRPretrainPreTransform:
     def __init__(self, img_size: int = 224):
         self.transform = transforms.Compose([
             transforms.RandomResizedCrop(img_size),
+            transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToTensor(),
         ])
 
@@ -151,7 +152,6 @@ class SimCLRPretrainPostTransform(nn.Module):
         self.normalize = normalize
 
         data_transforms = [
-            K.RandomHorizontalFlip(p=0.5),
             K.ColorJitter(
                 brightness=0.8 * self.jitter_strength,
                 contrast=0.8 * self.jitter_strength,

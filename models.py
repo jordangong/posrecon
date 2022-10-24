@@ -3,7 +3,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 from pl_bolts.models.self_supervised.resnets import Bottleneck, ResNet
-from timm.models.vision_transformer import PatchEmbed, Block
+from timm.models.vision_transformer import PatchEmbed, Block, Attention
 from torch import nn
 
 from utils.pos_embed import get_2d_sincos_pos_embed
@@ -367,6 +367,169 @@ class MaskedPosReconCLRViT(nn.Module):
             # latent: [batch_size, 1 + seq_len * mask_ratio, embed_dim]
 
             return latent[:, 0, :]
+
+
+class AttentionWithWeightOutput(Attention):
+    def forward(self, x, weight_output=False):
+        batch_size, seq_len, embed_dim = x.shape
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads,
+                          embed_dim // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        attn_weight = (q @ k.transpose(-2, -1)) * self.scale
+        attn_weight = attn_weight.softmax(dim=-1)
+        attn_weight = self.attn_drop(attn_weight)
+
+        x = (attn_weight @ v).transpose(1, 2).reshape(batch_size, seq_len, embed_dim)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return (x, attn_weight) if weight_output else (x, None)
+
+
+class BlockWithAttentionWeight(Block):
+    def __init__(
+            self,
+            dim,
+            num_heads,
+            mlp_ratio=4.,
+            qkv_bias=False,
+            drop=0.,
+            attn_drop=0.,
+            attention_weight=False,
+            *args,
+            **kwargs,
+    ):
+        super().__init__(dim, num_heads, mlp_ratio, qkv_bias,
+                         drop, attn_drop, *args, **kwargs)
+        self.attention_weight = attention_weight
+        self.attn = AttentionWithWeightOutput(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias,
+            attn_drop=attn_drop, proj_drop=drop
+        )
+
+    def forward(self, x):
+        x, attn_weight = self.attn(self.norm1(x), self.attention_weight)
+        x = x + self.drop_path1(self.ls1(x))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+
+        # Use dynamic return type here to make sequential module easier
+        return (x, attn_weight) if attn_weight is not None else x
+
+
+class SimCLRViT(nn.Module):
+    def __init__(
+            self,
+            img_size: int = 224,
+            patch_size: int = 16,
+            in_chans: int = 3,
+            embed_dim: int = 768,
+            depth: int = 12,
+            num_heads: int = 12,
+            mlp_ratio: int = 4,
+            proj_dim: int = 128,
+            drop_rate: float = 0.,
+            attention_drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
+            norm_layer: Callable = nn.LayerNorm,
+    ):
+        """
+        Args:
+            img_size: input image size
+            patch_size: patch size
+            in_chans: number of in channels
+            embed_dim: embedding dimension
+            depth: encoder number of Transformer blocks
+            num_heads: encoder number of self-attention heads
+            mlp_ratio: MLP dimension ratio (mlp_dim = embed_dim * mlp_ratio)
+            proj_dim: projection head output dimension
+            drop_rate: dropout rate
+            attention_drop_rate: attention dropout rate
+            drop_path_rate: stochastic depth rate
+            norm_layer: normalization layer
+        """
+        super().__init__()
+
+        # Encoder
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
+        num_patches = self.patch_embed.num_patches
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Following DeiT-3, exclude pos_embed from cls_token
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim),
+                                      requires_grad=False)
+
+        self.blocks = nn.Sequential(*[BlockWithAttentionWeight(
+            embed_dim, num_heads, mlp_ratio, qkv_bias=True, drop=drop_rate,
+            attn_drop=attention_drop_rate, drop_path=dpr.item(), norm_layer=norm_layer,
+            attention_weight=(True if layer == depth - 1 else False),
+        ) for layer, dpr in enumerate(torch.linspace(0, drop_path_rate, depth))
+        ])
+        self.norm = norm_layer(embed_dim)
+
+        # Projection head
+        self.proj_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.BatchNorm1d(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, proj_dim),
+        )
+
+        self.init_weights()
+
+    def init_weights(self):
+        pos_embed = get_2d_sincos_pos_embed(
+            self.pos_embed.size(-1), int(self.patch_embed.num_patches ** .5)
+        )
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Init weights in convolutional layers like in MLPs
+        patch_conv_weight = self.patch_embed.proj.weight.data
+        nn.init.xavier_uniform_(patch_conv_weight.view(patch_conv_weight.size(0), -1))
+
+        nn.init.normal_(self.cls_token, std=.02)
+
+        self.apply(self._init_other_weights)
+
+    def _init_other_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
+            nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def pre_encode(self, img, position):
+        x = self.patch_embed(img)
+        if position:
+            x += self.pos_embed
+        # x: [batch_size, seq_len, embed_dim]
+
+        return x
+
+    def forward_encoder(self, x):
+        # Concatenate [CLS] tokens w/o pos_embed
+        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        # x: [batch_size, 1 + seq_len, embed_dim]
+
+        x, attn_weight = self.blocks(x)
+        x = self.norm(x)
+        # x: [batch_size, 1 + seq_len, embed_dim]
+
+        return x, attn_weight
+
+    def forward(self, img, position=True):
+        # img: [batch_size, in_chans, height, weight]
+        x = self.pre_encode(img, position)
+        x, attn_weight = self.forward_encoder(x)
+        proj = self.proj_head(x[:, 0, :])
+        # proj: [batch_size, proj_dim]
+
+        return x, proj, attn_weight
 
 
 def info_nce_loss(feat1, feat2, temp, eps=1e-6):

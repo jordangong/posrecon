@@ -13,8 +13,8 @@ from timm.loss.cross_entropy import SoftTargetCrossEntropy
 from torch import nn
 from torchvision import transforms
 
-from main import PosReconCLR
-from models import MaskedPosReconCLRViT
+from main import MuitiHeadAttnMaskCLR
+from models import SimCLRViT
 from utils.datamodules import FewShotImagenetDataModule, CIFAR100DataModule, \
     Flowers102DataModule, OxfordIIITPetDataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
@@ -23,7 +23,7 @@ from utils.transforms import SimCLRFinetuneTransform, imagenet_normalization, \
     oxford_iiit_pet_normalization
 
 
-class PosReconCLREval(SSLFineTuner):
+class CLREvaluator(SSLFineTuner):
     def __init__(
             self,
             protocol: str = 'linear',
@@ -171,7 +171,7 @@ class PosReconCLREval(SSLFineTuner):
         param_groups = []
         # add backbone to params_groups while finetuning
         if self.protocol == "finetune":
-            if isinstance(self.backbone, MaskedPosReconCLRViT):
+            if isinstance(self.backbone, SimCLRViT):
                 param_groups += param_groups_lrd(
                     self.backbone,
                     lr=self.learning_rate,
@@ -300,30 +300,27 @@ if __name__ == "__main__":
     parser.add_argument("--log_steps", default=50, type=int)
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, type=BooleanOptionalAction)
-    parser = PosReconCLREval.add_model_specific_args(parser)
+    parser = CLREvaluator.add_model_specific_args(parser)
     args = parser.parse_args()
 
-    pretrained = PosReconCLR.load_from_checkpoint(args.ckpt_path, strict=False)
+    pretrained = MuitiHeadAttnMaskCLR.load_from_checkpoint(args.ckpt_path, strict=False)
     # a bit hacky here, replace ViT with dropout rate
-    if isinstance(pretrained.online_net, MaskedPosReconCLRViT):
-        pretained_state_dict = pretrained.state_dict()
-        pretrained.online_net = MaskedPosReconCLRViT(
-            pretrained.img_size,
-            pretrained.patch_size,
-            pretrained.in_chans,
-            pretrained.embed_dim,
-            pretrained.encoder_depth,
-            pretrained.encoder_num_heads,
-            pretrained.decoder_depth,
-            pretrained.decoder_num_heads,
-            pretrained.mlp_ratio,
-            pretrained.proj_dim,
-            drop_rate=args.mlp_dropout,
-            attention_drop_rate=args.attention_dropout,
-            drop_path_rate=args.path_dropout,
-            norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        )
-        pretrained.load_state_dict(pretained_state_dict)
+    pretained_state_dict = pretrained.state_dict()
+    pretrained.online_net = SimCLRViT(
+        pretrained.img_size,
+        pretrained.patch_size,
+        pretrained.in_chans,
+        pretrained.embed_dim,
+        pretrained.depth,
+        pretrained.num_heads,
+        pretrained.mlp_ratio,
+        pretrained.proj_dim,
+        drop_rate=args.mlp_dropout,
+        attention_drop_rate=args.attention_dropout,
+        drop_path_rate=args.path_dropout,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+    )
+    pretrained.load_state_dict(pretained_state_dict)
 
     if args.label_pct < 100:
         if args.dataset == "imagenet":
@@ -358,7 +355,7 @@ if __name__ == "__main__":
         transforms.ToTensor(),
     ])
 
-    evaluator = PosReconCLREval(
+    evaluator = CLREvaluator(
         protocol=args.protocol,
         dataset=args.dataset,
         img_size=pretrained.img_size,
