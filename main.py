@@ -224,7 +224,7 @@ class MuitiHeadAttnMaskCLR(LightningModule):
         # To fetch attention weight, forward target net first
         img_target = img[:, :, 0].reshape(-1, *img_dim)
         with torch.no_grad():
-            _, proj_target, attn_weight = self.target_net(img_target, self.position)
+            _, proj_target_, attn_weight = self.target_net(img_target, self.position)
 
         # To mask on embedding-level, manually forward online encoder
         img_online = img[:, :, 1:].reshape(-1, *img_dim)
@@ -233,10 +233,10 @@ class MuitiHeadAttnMaskCLR(LightningModule):
             patch_embed, attn_weight, self.online_mask_ratio
         )
         latent, _ = self.online_net.forward_encoder(masked_patch_embed)
-        proj_online = self.online_net.proj_head(latent[:, 0, :])
+        proj_online_ = self.online_net.proj_head(latent[:, 0, :])
 
         # Normalize and reshape for loss calculation
-        proj_target, proj_online = F.normalize(proj_target), F.normalize(proj_online)
+        proj_target, proj_online = F.normalize(proj_target_), F.normalize(proj_online_)
         proj_online = proj_online.view(-1, self.num_heads + 1, self.proj_dim)
         proj1_online, proj2_online = proj_online.chunk(2)
         proj1_target, proj2_target = proj_target.chunk(2)
@@ -259,7 +259,7 @@ class MuitiHeadAttnMaskCLR(LightningModule):
         )
         loss_batch_clr = (loss_batch_clr1 + loss_batch_clr2) / 2
 
-        return latent, (proj_online, proj_target), (loss_instance_clr, loss_batch_clr)
+        return latent, (proj_online_, proj_target_), (loss_instance_clr, loss_batch_clr)
 
     def training_step(self, batch, batch_idx):
         latent, proj_embed, losses = self.shared_step(batch)
