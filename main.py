@@ -44,7 +44,8 @@ class MuitiHeadAttnMaskCLR(LightningModule):
             max_epochs: int = 100,
             position: bool = True,
             online_mask_ratio: float = 0.75,
-            temperature: float = 0.1,
+            instance_temperature: float = 1,
+            batch_temperature: float = 0.1,
             loss_ratio: float = 1.,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
@@ -84,7 +85,8 @@ class MuitiHeadAttnMaskCLR(LightningModule):
         self.layer_decay = layer_decay
         self.position = position
         self.online_mask_ratio = online_mask_ratio
-        self.temperature = temperature
+        self.instance_temperature = instance_temperature
+        self.batch_temperature = batch_temperature
         self.loss_ratio = loss_ratio
 
         self.learning_rate = learning_rate
@@ -243,19 +245,19 @@ class MuitiHeadAttnMaskCLR(LightningModule):
 
         # Instance-level loss
         loss_instance_clr1, sim_instance1 = self.instance_contrast_loss(
-            proj1_online, proj2_target, self.temperature
+            proj1_online, proj2_target, self.instance_temperature
         )
         loss_instance_clr2, sim_instance2 = self.instance_contrast_loss(
-            proj2_online, proj1_target, self.temperature
+            proj2_online, proj1_target, self.instance_temperature
         )
         loss_instance_clr = (loss_instance_clr1 + loss_instance_clr2) / 2
 
         # Batch-level loss
         loss_batch_clr1 = self.batch_contrast_loss(
-            proj1_online, proj2_target, sim_instance1, self.temperature
+            proj1_online, proj2_target, sim_instance1, self.batch_temperature
         )
         loss_batch_clr2 = self.batch_contrast_loss(
-            proj2_online, proj1_target, sim_instance2, self.temperature
+            proj2_online, proj1_target, sim_instance2, self.batch_temperature
         )
         loss_batch_clr = (loss_batch_clr1 + loss_batch_clr2) / 2
 
@@ -389,8 +391,10 @@ class MuitiHeadAttnMaskCLR(LightningModule):
                             help="add positional embedding or not")
         parser.add_argument("--online_mask_ratio", default=0.75, type=float,
                             help="online network mask ratio of patches")
-        parser.add_argument("--temperature", default=0.1, type=float,
-                            help="temperature parameter in InfoNCE loss")
+        parser.add_argument("--instance_temperature", default=0.1, type=float,
+                            help="instance-level temperature in loss")
+        parser.add_argument("--batch_temperature", default=0.1, type=float,
+                            help="batch-level temperature in loss")
         parser.add_argument("--loss_ratio", default=1., type=float,
                             help="weight of two losses")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
