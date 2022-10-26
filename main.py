@@ -19,7 +19,7 @@ from utils.lr_wt_decay import param_groups_lrd
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
 
 
-class MuitiHeadAttnMaskCLR(LightningModule):
+class MultiHeadAttnMaskCLR(LightningModule):
     def __init__(
             self,
             gpus: int,
@@ -55,7 +55,7 @@ class MuitiHeadAttnMaskCLR(LightningModule):
             layer_decay: float = 1.,
             **kwargs
     ):
-        super(MuitiHeadAttnMaskCLR, self).__init__()
+        super(MultiHeadAttnMaskCLR, self).__init__()
         self.save_hyperparameters()
 
         self.gpus = gpus
@@ -414,7 +414,7 @@ if __name__ == '__main__':
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, action=BooleanOptionalAction)
     parser.add_argument("--knn_probe", default=True, action=BooleanOptionalAction)
-    parser = MuitiHeadAttnMaskCLR.add_model_specific_args(parser)
+    parser = MultiHeadAttnMaskCLR.add_model_specific_args(parser)
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
@@ -433,7 +433,7 @@ if __name__ == '__main__':
 
     dm.train_transforms = dm.val_transforms = SimCLRPretrainPreTransform(args.img_size)
 
-    model = MuitiHeadAttnMaskCLR(**args.__dict__)
+    model = MultiHeadAttnMaskCLR(**args.__dict__)
 
     logger = TensorBoardLogger(args.log_path, name="pretrain", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")

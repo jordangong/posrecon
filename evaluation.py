@@ -13,7 +13,7 @@ from timm.loss.cross_entropy import SoftTargetCrossEntropy
 from torch import nn
 from torchvision import transforms
 
-from main import MuitiHeadAttnMaskCLR
+from main import MultiHeadAttnMaskCLR
 from models import SimCLRViT
 from utils.datamodules import FewShotImagenetDataModule, CIFAR100DataModule, \
     Flowers102DataModule, OxfordIIITPetDataModule
@@ -303,7 +303,7 @@ if __name__ == "__main__":
     parser = CLREvaluator.add_model_specific_args(parser)
     args = parser.parse_args()
 
-    pretrained = MuitiHeadAttnMaskCLR.load_from_checkpoint(args.ckpt_path, strict=False)
+    pretrained = MultiHeadAttnMaskCLR.load_from_checkpoint(args.ckpt_path, strict=False)
     # a bit hacky here, replace ViT with dropout rate
     pretained_state_dict = pretrained.state_dict()
     pretrained.online_net = SimCLRViT(
