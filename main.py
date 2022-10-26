@@ -13,13 +13,13 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 
-from models import SimCLRViT
+from models import SimCLRMaskedViT
 from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_wt_decay import param_groups_lrd
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
 
 
-class MultiHeadAttnMaskBYOL(LightningModule):
+class RandMaskedBYOL(LightningModule):
     def __init__(
             self,
             gpus: int,
@@ -44,6 +44,7 @@ class MultiHeadAttnMaskBYOL(LightningModule):
             max_epochs: int = 100,
             position: bool = True,
             online_mask_ratio: float = 0.75,
+            target_mask_ratio: float = 0.75,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
@@ -52,7 +53,7 @@ class MultiHeadAttnMaskBYOL(LightningModule):
             layer_decay: float = 1.,
             **kwargs
     ):
-        super(MultiHeadAttnMaskBYOL, self).__init__()
+        super(RandMaskedBYOL, self).__init__()
         self.save_hyperparameters()
 
         self.gpus = gpus
@@ -82,6 +83,7 @@ class MultiHeadAttnMaskBYOL(LightningModule):
         self.layer_decay = layer_decay
         self.position = position
         self.online_mask_ratio = online_mask_ratio
+        self.target_mask_ratio = target_mask_ratio
 
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
@@ -98,7 +100,7 @@ class MultiHeadAttnMaskBYOL(LightningModule):
             normalize=normalization,
         )
 
-        self.online_net = SimCLRViT(
+        self.online_net = SimCLRMaskedViT(
             img_size,
             patch_size,
             in_chans,
@@ -136,70 +138,17 @@ class MultiHeadAttnMaskBYOL(LightningModule):
 
         return x[:, 0, :]
 
-    @staticmethod
-    def multi_head_attn_mask(patch_embed, attn_weight, mask_ratio):
-        """
-        Multi-head attention-guided masking
-        Args:
-            patch_embed: [batch_size * (num_heads + 1), seq_len, embed_dim]
-            attn_weight: [batch_size, num_heads, 1 + seq_len, 1 + seq_len]
-            mask_ratio: ratio of # of masked patches to # of patches
-        return:
-            masked_patch_embed: [batch_size * (num_heads + 1),
-                                 seq_len * (1 - mask_ratio), embed_dim]
-        """
-        _, seq_len, embed_dim = patch_embed.size()
-
-        cls_attn_weight = attn_weight[:, :, 0, 1:]
-        # cls_attn_weight: [batch_size, num_heads, seq_len]
-        cls_attn_head_avg_weight = cls_attn_weight.mean(1)
-        # cls_attn_head_avg_weight: [batch_size, seq_len]
-        cls_attn_weight = torch.cat((cls_attn_weight.view(-1, seq_len),
-                                     cls_attn_head_avg_weight))
-        # cls_attn_weight: [batch_size * (num_heads + 1), seq_len]
-        attn_ranked_indices = cls_attn_weight.argsort(descending=True)
-
-        visible_len = int(seq_len * (1 - mask_ratio))
-        visible_indices = attn_ranked_indices[:, :visible_len]
-        # visible_indices: [batch_size * (num_heads + 1), seq_len * mask_ratio]
-        expand_visible_indices = visible_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
-        # expand_visible_indices: [batch_size * (num_heads + 1), seq_len * (1 - mask_ratio), embed_dim]
-        masked_patch_embed = patch_embed.gather(1, expand_visible_indices)
-        # masked_patch_embed: [batch_size * (num_heads + 1), seq_len * (1 - mask_ratio), embed_dim]
-
-        return masked_patch_embed
-
     def shared_step(self, batch):
-        (crop1, crop2), _ = batch
-        batch_size, *img_dim = crop1.size()
-        crops = torch.stack((crop1, crop2))
-        # crops: [2, batch_size, in_chans, height, width]
-        num_masks = self.num_heads + 1  # Last one for attention mean
-        #                                             another one for target
-        crops = crops.unsqueeze(2).expand(-1, -1, num_masks + 1, *img_dim)
-        # crops: [2, batch_size, num_heads+2, in_chans, height, width]
-        img = self.transform(crops.reshape(-1, *img_dim)).view_as(crops)
-        # img: [2, batch_size, num_heads+2, in_chans, height, width]
+        img, _ = batch
+        img = self.transform(torch.cat(img))
 
-        # To fetch attention weight, forward target net first
-        img_target = img[:, :, 0].reshape(-1, *img_dim)
-        with torch.no_grad():
-            _, proj_target, attn_weight = self.target_net(img_target, self.position)
-
-        # To mask on embedding-level, manually forward online encoder
-        img_online = img[:, :, 1:].reshape(-1, *img_dim)
-        patch_embed = self.online_net.pre_encode(img_online, self.position)
-        masked_patch_embed = self.multi_head_attn_mask(
-            patch_embed, attn_weight, self.online_mask_ratio
-        )
-        latent, _ = self.online_net.forward_encoder(masked_patch_embed)
-        proj_online = self.online_net.proj_head(latent[:, 0, :])
+        latent, proj_online, _ = self.online_net(img, self.position, self.online_mask_ratio)
         pred_online = self.pred_head(proj_online)
+        with torch.no_grad():
+            _, proj_target, _ = self.target_net(img, self.position, self.target_mask_ratio)
 
-        pred_online = pred_online.view(-1, self.num_heads + 1, self.proj_dim)
         pred1_online, pred2_online = pred_online.chunk(2)
-        proj_target_expand = proj_target.unsqueeze(1).expand(-1, num_masks, -1)
-        proj1_target, proj2_target = proj_target_expand.chunk(2)
+        proj1_target, proj2_target = proj_target.chunk(2)
 
         loss_1to2 = 2 - 2 * F.cosine_similarity(pred1_online, proj2_target, dim=-1).mean()
         loss_2to1 = 2 - 2 * F.cosine_similarity(pred2_online, proj1_target, dim=-1).mean()
@@ -336,6 +285,8 @@ class MultiHeadAttnMaskBYOL(LightningModule):
                             help="add positional embedding or not")
         parser.add_argument("--online_mask_ratio", default=0.75, type=float,
                             help="online network mask ratio of patches")
+        parser.add_argument("--target_mask_ratio", default=0.75, type=float,
+                            help="target network mask ratio of patches")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
                             help="weight decay")
         parser.add_argument("--layer_decay", default=1., type=float,
@@ -353,7 +304,7 @@ if __name__ == '__main__':
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, action=BooleanOptionalAction)
     parser.add_argument("--knn_probe", default=True, action=BooleanOptionalAction)
-    parser = MultiHeadAttnMaskBYOL.add_model_specific_args(parser)
+    parser = RandMaskedBYOL.add_model_specific_args(parser)
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
@@ -372,7 +323,7 @@ if __name__ == '__main__':
 
     dm.train_transforms = dm.val_transforms = SimCLRPretrainPreTransform(args.img_size)
 
-    model = MultiHeadAttnMaskBYOL(**args.__dict__)
+    model = RandMaskedBYOL(**args.__dict__)
 
     logger = TensorBoardLogger(args.log_path, name="pretrain", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")
