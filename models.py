@@ -520,13 +520,13 @@ class SimCLRViT(nn.Module):
         x = self.norm(x)
         # x: [batch_size, 1 + seq_len, embed_dim]
 
-        return x, attn_weight
+        return x[:, 0, :], attn_weight
 
     def forward(self, img, position=True):
         # img: [batch_size, in_chans, height, weight]
         x = self.pre_encode(img, position)
         x, attn_weight = self.forward_encoder(x)
-        proj = self.proj_head(x[:, 0, :])
+        proj = self.proj_head(x)
         # proj: [batch_size, proj_dim]
 
         return x, proj, attn_weight
@@ -592,7 +592,7 @@ class SimCLRMaskedViT(SimCLRViT):
     def forward(self, x, position=True, mask_ratio=0.):
         x = self.pre_encode(x, position, mask_ratio)
         x, attn_weight = self.forward_encoder(x)
-        proj = self.proj_head(x[:, 0, :])
+        proj = self.proj_head(x)
         # proj: [batch_size, proj_dim]
 
         return x, proj, attn_weight

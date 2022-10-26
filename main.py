@@ -12,6 +12,7 @@ from pytorch_lightning import Trainer, LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
+from torchmetrics import Accuracy
 
 from models import SimCLRMaskedViT
 from utils.datamodules import FewShotImagenetDataModule
@@ -27,6 +28,7 @@ class RandMaskedBYOL(LightningModule):
             batch_size: int,
             num_nodes: int = 1,
             dataset: str = "imagenet",
+            num_classes: int = 1000,
             gaussian_blur: bool = True,
             jitter_strength: float = 1.,
             img_size: int = 224,
@@ -59,6 +61,7 @@ class RandMaskedBYOL(LightningModule):
         self.gpus = gpus
         self.num_nodes = num_nodes
         self.dataset = dataset
+        self.num_classes = num_classes
         self.gaussian_blur = gaussian_blur
         self.jitter_strength = jitter_strength
         self.num_samples = num_samples
@@ -121,6 +124,12 @@ class RandMaskedBYOL(LightningModule):
             nn.GELU(),
             nn.Linear(embed_dim, proj_dim),
         )
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+        self.train_acc_top_1 = Accuracy(top_k=1)
+        self.train_acc_top_5 = Accuracy(top_k=5)
+        self.val_acc_top_1 = Accuracy(top_k=1, compute_on_step=False)
+        self.val_acc_top_5 = Accuracy(top_k=5, compute_on_step=False)
 
         # compute iters per epoch
         global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
@@ -136,13 +145,12 @@ class RandMaskedBYOL(LightningModule):
         x = self.normalization(x)
         x, *_ = self.online_net(x, position)
 
-        return x[:, 0, :]
+        return x
 
-    def shared_step(self, batch):
-        img, _ = batch
+    def shared_step(self, img):
         img = self.transform(torch.cat(img))
 
-        latent, proj_online, _ = self.online_net(img, self.position, self.online_mask_ratio)
+        reps, proj_online, _ = self.online_net(img, self.position, self.online_mask_ratio)
         pred_online = self.pred_head(proj_online)
         with torch.no_grad():
             _, proj_target, _ = self.target_net(img, self.position, self.target_mask_ratio)
@@ -152,35 +160,60 @@ class RandMaskedBYOL(LightningModule):
 
         loss_1to2 = 2 - 2 * F.cosine_similarity(pred1_online, proj2_target, dim=-1).mean()
         loss_2to1 = 2 - 2 * F.cosine_similarity(pred2_online, proj1_target, dim=-1).mean()
-        loss_total = loss_1to2 + loss_2to1
+        loss_total = (loss_1to2 + loss_2to1) / 2
 
-        return (latent,
+        return (reps,
                 (proj_online, pred_online, proj_target),
                 (loss_1to2, loss_2to1, loss_total))
 
+    def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
+        labels = labels.repeat(2)
+        logits = self.classifier(reps)
+        loss = F.cross_entropy(logits, labels)
+        acc_top_1 = acc_top_1_fn(logits.softmax(-1), labels)
+        acc_top_5 = acc_top_5_fn(logits.softmax(-1), labels)
+
+        return loss, acc_top_1, acc_top_5
+
     def training_step(self, batch, batch_idx):
-        latent, proj_embed, losses = self.shared_step(batch)
+        img, labels = batch
+        reps, proj_embed, losses = self.shared_step(img)
+
+        loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
+            reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
+        )
 
         self.log_dict({
             'loss/1to2/train': losses[0],
             'loss/2to1/train': losses[1],
             'loss/pretrain/train': losses[2],
-            'norm/latent': latent.norm(dim=-1).mean(),
+            'loss/linear_probe/train': loss_xent,
+            'acc/linear_probe_top_1/train': acc_top_1,
+            'acc/linear_probe_top_5/train': acc_top_5,
+            'norm/reps': reps.norm(dim=-1).mean(),
             'norm/proj_online': proj_embed[0].norm(dim=-1).mean(),
             'norm/pred_online': proj_embed[1].norm(dim=-1).mean(),
             'norm/proj_target': proj_embed[2].norm(dim=-1).mean(),
         }, sync_dist=True)
-        return losses[2]
+        return losses[2] + loss_xent
 
     def validation_step(self, batch, batch_idx):
-        *_, losses = self.shared_step(batch)
+        img, labels = batch
+        reps, proj_embed, losses = self.shared_step(img)
+
+        loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
+            reps.detach(), labels, self.val_acc_top_1, self.val_acc_top_5
+        )
 
         self.log_dict({
             'loss/1to2/val': losses[0],
             'loss/2to1/val': losses[1],
             'loss/pretrain/val': losses[2],
+            'loss/linear_probe/val': loss_xent,
+            'acc/linear_probe_top_1/val': acc_top_1,
+            'acc/linear_probe_top_5/val': acc_top_5,
         }, sync_dist=True)
-        return losses[2]
+        return losses[2] + loss_xent
 
     def configure_optimizers(self):
         param_groups = param_groups_lrd(
@@ -303,7 +336,7 @@ if __name__ == '__main__':
     parser.add_argument("--log_path", default="lightning_logs", type=str)
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, action=BooleanOptionalAction)
-    parser.add_argument("--knn_probe", default=True, action=BooleanOptionalAction)
+    parser.add_argument("--knn_probe", default=False, action='store_true')
     parser = RandMaskedBYOL.add_model_specific_args(parser)
     args = parser.parse_args()
 
@@ -318,6 +351,7 @@ if __name__ == '__main__':
                                     batch_size=args.batch_size,
                                     num_workers=args.num_workers)
         args.num_samples = dm.num_samples
+        args.num_classes = 1000
     else:
         raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
 
