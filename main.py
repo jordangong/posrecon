@@ -1,4 +1,3 @@
-import copy
 from argparse import ArgumentParser, BooleanOptionalAction
 from functools import partial
 
@@ -14,13 +13,13 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 from torchmetrics import Accuracy
 
-from models import SimCLRMaskedViT
+from models import SimCLRMaskedViT, info_nce_loss
 from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_wt_decay import param_groups_lrd
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
 
 
-class RandMaskedBYOL(LightningModule):
+class RandMaskedSimCLR(LightningModule):
     def __init__(
             self,
             gpus: int,
@@ -45,17 +44,16 @@ class RandMaskedBYOL(LightningModule):
             warmup_epochs: int = 10,
             max_epochs: int = 100,
             position: bool = True,
-            online_mask_ratio: float = 0.75,
-            target_mask_ratio: float = 0.75,
+            mask_ratio: float = 0.75,
+            temperature: float = 0.1,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
-            ema_momentum: float = 0.99,
             weight_decay: float = 1e-6,
             layer_decay: float = 1.,
             **kwargs
     ):
-        super(RandMaskedBYOL, self).__init__()
+        super(RandMaskedSimCLR, self).__init__()
         self.save_hyperparameters()
 
         self.gpus = gpus
@@ -85,13 +83,12 @@ class RandMaskedBYOL(LightningModule):
         self.weight_decay = weight_decay
         self.layer_decay = layer_decay
         self.position = position
-        self.online_mask_ratio = online_mask_ratio
-        self.target_mask_ratio = target_mask_ratio
+        self.mask_ratio = mask_ratio
+        self.temperature = temperature
 
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
-        self.ema_momentum = ema_momentum
 
         if dataset == "imagenet":
             normalization = imagenet_normalization()
@@ -103,7 +100,7 @@ class RandMaskedBYOL(LightningModule):
             normalize=normalization,
         )
 
-        self.online_net = SimCLRMaskedViT(
+        self.siamese_net = SimCLRMaskedViT(
             img_size,
             patch_size,
             in_chans,
@@ -117,13 +114,6 @@ class RandMaskedBYOL(LightningModule):
             drop_path_rate,
             partial(nn.LayerNorm, eps=1e-6),
         )
-        self.target_net = copy.deepcopy(self.online_net)
-        self.pred_head = nn.Sequential(
-            nn.Linear(proj_dim, embed_dim),
-            nn.BatchNorm1d(embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, proj_dim),
-        )
         self.classifier = nn.Linear(embed_dim, num_classes)
 
         self.train_acc_top_1 = Accuracy(top_k=1)
@@ -135,36 +125,18 @@ class RandMaskedBYOL(LightningModule):
         global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
         self.train_iters_per_epoch = num_samples // global_batch_size
 
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        for online_p, target_p in zip(self.online_net.parameters(),
-                                      self.target_net.parameters()):
-            em = self.ema_momentum
-            target_p.data = target_p.data * em + online_p.data * (1.0 - em)
-
     def forward(self, x, position=True):
         x = self.normalization(x)
-        x, *_ = self.online_net(x, position)
+        x, *_ = self.siamese_net(x, position)
 
         return x
 
     def shared_step(self, img):
         img = self.transform(torch.cat(img))
+        reps, proj, _ = self.siamese_net(img, self.position, self.mask_ratio)
+        loss = info_nce_loss(*proj.chunk(2), self.temperature)
 
-        reps, proj_online, _ = self.online_net(img, self.position, self.online_mask_ratio)
-        pred_online = self.pred_head(proj_online)
-        with torch.no_grad():
-            _, proj_target, _ = self.target_net(img, self.position, self.target_mask_ratio)
-
-        pred1_online, pred2_online = pred_online.chunk(2)
-        proj1_target, proj2_target = proj_target.chunk(2)
-
-        loss_1to2 = 2 - 2 * F.cosine_similarity(pred1_online, proj2_target, dim=-1).mean()
-        loss_2to1 = 2 - 2 * F.cosine_similarity(pred2_online, proj1_target, dim=-1).mean()
-        loss_total = (loss_1to2 + loss_2to1) / 2
-
-        return (reps,
-                (proj_online, pred_online, proj_target),
-                (loss_1to2, loss_2to1, loss_total))
+        return reps, proj, loss
 
     def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
         labels = labels.repeat(2)
@@ -177,47 +149,41 @@ class RandMaskedBYOL(LightningModule):
 
     def training_step(self, batch, batch_idx):
         img, labels = batch
-        reps, proj_embed, losses = self.shared_step(img)
+        reps, proj, loss = self.shared_step(img)
 
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
             reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
         )
 
         self.log_dict({
-            'loss/1to2/train': losses[0],
-            'loss/2to1/train': losses[1],
-            'loss/pretrain/train': losses[2],
+            'loss/pretrain/train': loss,
             'loss/linear_probe/train': loss_xent,
             'acc/linear_probe_top_1/train': acc_top_1,
             'acc/linear_probe_top_5/train': acc_top_5,
             'norm/reps': reps.norm(dim=-1).mean(),
-            'norm/proj_online': proj_embed[0].norm(dim=-1).mean(),
-            'norm/pred_online': proj_embed[1].norm(dim=-1).mean(),
-            'norm/proj_target': proj_embed[2].norm(dim=-1).mean(),
+            'norm/proj': proj.norm(dim=-1).mean(),
         }, sync_dist=True)
-        return losses[2] + loss_xent
+        return loss + loss_xent
 
     def validation_step(self, batch, batch_idx):
         img, labels = batch
-        reps, proj_embed, losses = self.shared_step(img)
+        reps, proj, loss = self.shared_step(img)
 
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
             reps.detach(), labels, self.val_acc_top_1, self.val_acc_top_5
         )
 
         self.log_dict({
-            'loss/1to2/val': losses[0],
-            'loss/2to1/val': losses[1],
-            'loss/pretrain/val': losses[2],
+            'loss/pretrain/val': loss,
             'loss/linear_probe/val': loss_xent,
             'acc/linear_probe_top_1/val': acc_top_1,
             'acc/linear_probe_top_5/val': acc_top_5,
         }, sync_dist=True)
-        return losses[2] + loss_xent
+        return loss + loss_xent
 
     def configure_optimizers(self):
         param_groups = param_groups_lrd(
-            self.online_net,
+            self.siamese_net,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
             exclude_1d_params=self.exclude_bn_bias,
@@ -309,17 +275,15 @@ class RandMaskedBYOL(LightningModule):
                             help="max steps")
         parser.add_argument("--warmup_epochs", default=10, type=int,
                             help="number of warmup epochs")
-        parser.add_argument("--ema_momentum", default=0.99, type=float,
-                            help="ema momentum")
         parser.add_argument("--batch_size", default=128, type=int,
                             help="batch size per gpu")
 
         parser.add_argument("--position", default=True, action=BooleanOptionalAction,
                             help="add positional embedding or not")
-        parser.add_argument("--online_mask_ratio", default=0.75, type=float,
-                            help="online network mask ratio of patches")
-        parser.add_argument("--target_mask_ratio", default=0.75, type=float,
-                            help="target network mask ratio of patches")
+        parser.add_argument("--mask_ratio", default=0.75, type=float,
+                            help="mask ratio of patches")
+        parser.add_argument("--temperature", default=0.1, type=float,
+                            help="temperature parameter in InfoNCE loss")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
                             help="weight decay")
         parser.add_argument("--layer_decay", default=1., type=float,
@@ -337,7 +301,7 @@ if __name__ == '__main__':
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, action=BooleanOptionalAction)
     parser.add_argument("--knn_probe", default=False, action='store_true')
-    parser = RandMaskedBYOL.add_model_specific_args(parser)
+    parser = RandMaskedSimCLR.add_model_specific_args(parser)
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
@@ -357,7 +321,7 @@ if __name__ == '__main__':
 
     dm.train_transforms = dm.val_transforms = SimCLRPretrainPreTransform(args.img_size)
 
-    model = RandMaskedBYOL(**args.__dict__)
+    model = RandMaskedSimCLR(**args.__dict__)
 
     logger = TensorBoardLogger(args.log_path, name="pretrain", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")
