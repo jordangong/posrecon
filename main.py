@@ -180,13 +180,13 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
     @staticmethod
     def instance_contrast_loss(proj_online, proj_target, temp):
-        # Instance-level contrast
-        # positive pairs: mean attention masked and target
+        # Instance-level contrast (cross views only)
+        # positive pairs: mean attention masked (crop 1) and target (crop 2)
         # proj_online: [batch_size, num_heads + 1, proj_dim]
         # proj_target: [batch_size, proj_dim]
         feat = torch.cat((proj_online, proj_target.unsqueeze(1)), dim=1)
         # feat: [batch_size, num_heads + 2, proj_dim]
-        all_sim = (feat @ feat.transpose(1, 2))
+        all_sim = feat @ feat.transpose(1, 2)
         all_sim.diagonal(dim1=-2, dim2=-1).fill_(0)
         # all_sim: [batch_size, num_heads + 2, num_heads + 2]
         all_ = torch.exp(all_sim / temp).sum(dim=(-2, -1))
@@ -194,28 +194,46 @@ class MultiHeadAttnMaskCLR(LightningModule):
         pos_sim = (proj_online[:, -1:] @ proj_target.unsqueeze(-1)).squeeze()
         # pos_sim: [batch_size]
         pos = torch.exp(pos_sim / temp) * 2
-        loss = -torch.log(pos / all_).mean()
+        loss = -torch.log(torch.sqrt(pos / all_)).mean()
 
-        return loss, all_sim
+        return loss
 
     @staticmethod
-    def batch_contrast_loss(proj_online, proj_target, sim_instance, temp):
-        # Batch-level contrast
-        # positive pairs: all instance-level pairs
+    def batch_contrast_loss(proj1, proj2, temp):
+        # Batch-level contrast (all views), similar to InfoNCE but with more positive pairs
+        # positive pairs: all instance-level pairs = 2 * (num_heads+2)^2 * batch_size
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            proj_online = SyncFunction.apply(proj_online)
-            proj_target = SyncFunction.apply(proj_target)
-            sim_instance = SyncFunction.apply(sim_instance)
-        # proj_online: [batch_size*2 (* world_size), num_heads + 1, proj_dim]
-        # proj_target: [batch_size*2 (* world_size), proj_dim]
+            proj1 = SyncFunction.apply(proj1)
+            proj2 = SyncFunction.apply(proj1)
+        # proj1: [batch_size (* world_size), num_heads + 2, proj_dim]
+        # proj2: [batch_size (* world_size), num_heads + 2, proj_dim]
         # sim_instance: [batch_size*2 (* world_size), num_heads + 2, num_heads + 2]
-        *_, proj_dim = proj_online.size()
-        feat = torch.cat((proj_online.view(-1, proj_dim), proj_target))
-        # feat: [batch_size*2 (* world_size) * (num_heads+2), proj_dim]
+        _, num_masks, proj_dim = proj1.size()
+        feat = torch.cat((proj1.view(-1, proj_dim), proj2.view(-1, proj_dim)))
+        # feat: [batch_size (* world_size) * (num_heads + 2) * 2, proj_dim]
+
         all_sim = (feat @ feat.T).fill_diagonal_(0)
-        # feat: [batch_size*2 (* world_size) * (num_heads+2), ...]
+        # all_sim: [batch_size (* world_size) * (num_heads + 2) * 2, ...]
         all_ = torch.exp(all_sim / temp).sum(-1)
-        pos = torch.exp(sim_instance / temp).sum(dim=-1).view(-1)
+        # all_: [batch_size (* world_size) * (num_heads + 2) * 2]
+
+        pos_1to1 = proj1 @ proj1.transpose(1, 2)
+        pos_1to1.diagonal(dim1=-2, dim2=-1).fill_(0)
+        pos_1to2 = proj1 @ proj2.transpose(1, 2)
+        pos_1to2.diagonal(dim1=-2, dim2=-1).fill_(0)
+        pos_2to1 = proj2 @ proj1.transpose(1, 2)
+        pos_2to1.diagonal(dim1=-2, dim2=-1).fill_(0)
+        pos_2to2 = proj2 @ proj2.transpose(1, 2)
+        pos_2to2.diagonal(dim1=-2, dim2=-1).fill_(0)
+        # pos_{1,2}_{1,2}: [batch_size (* world_size), num_heads + 2, num_heads + 2]
+        pos_sim = torch.cat((
+            torch.cat((pos_1to1, pos_1to2), dim=2).view(-1, 2 * num_masks),
+            torch.cat((pos_2to1, pos_2to2), dim=2).view(-1, 2 * num_masks),
+        ))
+        # pos_sim: [batch_size (* world_size) * (num_heads + 2) * 2, (num_heads + 2) * 2]
+        pos = torch.exp(pos_sim / temp).sum(-1)
+        # pos: [batch_size (* world_size) * (num_heads + 2) * 2]
+
         loss = -torch.log(pos / all_).mean()
 
         return loss
@@ -252,23 +270,19 @@ class MultiHeadAttnMaskCLR(LightningModule):
         proj1_online, proj2_online = proj_online.chunk(2)
         proj1_target, proj2_target = proj_target.chunk(2)
 
-        # Instance-level loss
-        loss_instance_clr1, sim_instance1 = self.instance_contrast_loss(
+        # Instance-level loss, cross-view contrast
+        loss_instance_clr1 = self.instance_contrast_loss(
             proj1_online, proj2_target, self.instance_temperature
         )
-        loss_instance_clr2, sim_instance2 = self.instance_contrast_loss(
+        loss_instance_clr2 = self.instance_contrast_loss(
             proj2_online, proj1_target, self.instance_temperature
         )
         loss_instance_clr = (loss_instance_clr1 + loss_instance_clr2) / 2
 
-        # Batch-level loss
-        loss_batch_clr1 = self.batch_contrast_loss(
-            proj1_online, proj2_target, sim_instance1, self.batch_temperature
-        )
-        loss_batch_clr2 = self.batch_contrast_loss(
-            proj2_online, proj1_target, sim_instance2, self.batch_temperature
-        )
-        loss_batch_clr = (loss_batch_clr1 + loss_batch_clr2) / 2
+        # Batch-level loss, all-view contrast
+        proj1 = torch.cat((proj1_online, proj1_target.unsqueeze(1)), dim=1)
+        proj2 = torch.cat((proj2_online, proj2_target.unsqueeze(1)), dim=1)
+        loss_batch_clr = self.batch_contrast_loss(proj1, proj2, self.batch_temperature)
 
         loss_total = (self.loss_ratio * loss_instance_clr
                       + (1 - self.loss_ratio) * loss_batch_clr)
