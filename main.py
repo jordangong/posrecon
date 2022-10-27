@@ -12,10 +12,11 @@ from pytorch_lightning import Trainer, LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
+from torchmetrics import Accuracy
 
 from models import SimCLRViT
 from utils.datamodules import FewShotImagenetDataModule
-from utils.lr_wt_decay import param_groups_lrd
+from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
 
 
@@ -27,6 +28,7 @@ class MultiHeadAttnMaskBYOL(LightningModule):
             batch_size: int,
             num_nodes: int = 1,
             dataset: str = "imagenet",
+            num_classes: int = 1000,
             gaussian_blur: bool = True,
             jitter_strength: float = 1.,
             img_size: int = 224,
@@ -58,6 +60,7 @@ class MultiHeadAttnMaskBYOL(LightningModule):
         self.gpus = gpus
         self.num_nodes = num_nodes
         self.dataset = dataset
+        self.num_classes = num_classes
         self.gaussian_blur = gaussian_blur
         self.jitter_strength = jitter_strength
         self.num_samples = num_samples
@@ -119,6 +122,12 @@ class MultiHeadAttnMaskBYOL(LightningModule):
             nn.GELU(),
             nn.Linear(embed_dim, proj_dim),
         )
+        self.classifier = nn.Linear(embed_dim, num_classes)
+
+        self.train_acc_top_1 = Accuracy(top_k=1)
+        self.train_acc_top_5 = Accuracy(top_k=5)
+        self.val_acc_top_1 = Accuracy(top_k=1, compute_on_step=False)
+        self.val_acc_top_5 = Accuracy(top_k=5, compute_on_step=False)
 
         # compute iters per epoch
         global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
@@ -134,7 +143,7 @@ class MultiHeadAttnMaskBYOL(LightningModule):
         x = self.normalization(x)
         x, *_ = self.online_net(x, position)
 
-        return x[:, 0, :]
+        return x
 
     @staticmethod
     def multi_head_attn_mask(patch_embed, attn_weight, mask_ratio):
@@ -169,8 +178,8 @@ class MultiHeadAttnMaskBYOL(LightningModule):
 
         return masked_patch_embed
 
-    def shared_step(self, batch):
-        (crop1, crop2), _ = batch
+    def shared_step(self, img):
+        crop1, crop2 = img
         batch_size, *img_dim = crop1.size()
         crops = torch.stack((crop1, crop2))
         # crops: [2, batch_size, in_chans, height, width]
@@ -192,8 +201,8 @@ class MultiHeadAttnMaskBYOL(LightningModule):
         masked_patch_embed = self.multi_head_attn_mask(
             patch_embed, attn_weight, self.online_mask_ratio
         )
-        latent, _ = self.online_net.forward_encoder(masked_patch_embed)
-        proj_online = self.online_net.proj_head(latent[:, 0, :])
+        reps, _ = self.online_net.forward_encoder(masked_patch_embed)
+        proj_online = self.online_net.proj_head(reps)
         pred_online = self.pred_head(proj_online)
 
         pred_online = pred_online.view(-1, self.num_heads + 1, self.proj_dim)
@@ -203,35 +212,60 @@ class MultiHeadAttnMaskBYOL(LightningModule):
 
         loss_1to2 = 2 - 2 * F.cosine_similarity(pred1_online, proj2_target, dim=-1).mean()
         loss_2to1 = 2 - 2 * F.cosine_similarity(pred2_online, proj1_target, dim=-1).mean()
-        loss_total = loss_1to2 + loss_2to1
+        loss_total = (loss_1to2 + loss_2to1) / 2
 
-        return (latent,
+        return (reps,
                 (proj_online, pred_online, proj_target),
                 (loss_1to2, loss_2to1, loss_total))
 
+    def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
+        labels = labels.unsqueeze(0).unsqueeze(-1).expand(2, -1, self.num_heads + 1).reshape(-1)
+        logits = self.classifier(reps)
+        loss = F.cross_entropy(logits, labels)
+        acc_top_1 = acc_top_1_fn(logits.softmax(-1), labels)
+        acc_top_5 = acc_top_5_fn(logits.softmax(-1), labels)
+
+        return loss, acc_top_1, acc_top_5
+
     def training_step(self, batch, batch_idx):
-        latent, proj_embed, losses = self.shared_step(batch)
+        img, labels = batch
+        reps, proj_embed, losses = self.shared_step(img)
+
+        loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
+            reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
+        )
 
         self.log_dict({
             'loss/1to2/train': losses[0],
             'loss/2to1/train': losses[1],
             'loss/pretrain/train': losses[2],
-            'norm/latent': latent.norm(dim=-1).mean(),
+            'loss/linear_probe/train': loss_xent,
+            'acc/linear_probe_top_1/train': acc_top_1,
+            'acc/linear_probe_top_5/train': acc_top_5,
+            'norm/reps': reps.norm(dim=-1).mean(),
             'norm/proj_online': proj_embed[0].norm(dim=-1).mean(),
             'norm/pred_online': proj_embed[1].norm(dim=-1).mean(),
             'norm/proj_target': proj_embed[2].norm(dim=-1).mean(),
         }, sync_dist=True)
-        return losses[2]
+        return losses[2] + loss_xent
 
     def validation_step(self, batch, batch_idx):
-        *_, losses = self.shared_step(batch)
+        img, labels = batch
+        reps, _, losses = self.shared_step(img)
+
+        loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
+            reps.detach(), labels, self.val_acc_top_1, self.val_acc_top_5
+        )
 
         self.log_dict({
             'loss/1to2/val': losses[0],
             'loss/2to1/val': losses[1],
             'loss/pretrain/val': losses[2],
+            'loss/linear_probe/val': loss_xent,
+            'acc/linear_probe_top_1/val': acc_top_1,
+            'acc/linear_probe_top_5/val': acc_top_5,
         }, sync_dist=True)
-        return losses[2]
+        return losses[2] + loss_xent
 
     def configure_optimizers(self):
         param_groups = param_groups_lrd(
@@ -242,6 +276,14 @@ class MultiHeadAttnMaskBYOL(LightningModule):
             no_weight_decay_list=("pos_embed", "cls_token"),
             layer_decay=self.layer_decay
         )
+        if self.exclude_bn_bias:
+            param_groups += exclude_from_wt_decay(self.pred_head, self.weight_decay)
+            param_groups += exclude_from_wt_decay(self.classifier, self.weight_decay)
+        else:
+            param_groups += [
+                {"params": self.pred_head.parameters(), "weight_decay": self.weight_decay},
+                {"params": self.classifier.parameters(), "weight_decay": self.weight_decay},
+            ]
 
         if self.optim == "lars":
             optimizer = optim.LARS(param_groups, lr=self.learning_rate, momentum=0.9)
@@ -352,7 +394,7 @@ if __name__ == '__main__':
     parser.add_argument("--log_path", default="lightning_logs", type=str)
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, action=BooleanOptionalAction)
-    parser.add_argument("--knn_probe", default=True, action=BooleanOptionalAction)
+    parser.add_argument("--knn_probe", default=False, action='store_true')
     parser = MultiHeadAttnMaskBYOL.add_model_specific_args(parser)
     args = parser.parse_args()
 
