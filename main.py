@@ -126,6 +126,8 @@ class RandMaskedBYOL(LightningModule):
         )
         self.classifier = nn.Linear(embed_dim, num_classes)
 
+        self.pred_head.apply(self.online_net._init_other_weights)
+
         self.train_acc_top_1 = Accuracy(top_k=1)
         self.train_acc_top_5 = Accuracy(top_k=5)
         self.val_acc_top_1 = Accuracy(top_k=1, compute_on_step=False)
