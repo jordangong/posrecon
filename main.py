@@ -15,7 +15,7 @@ from torchmetrics import Accuracy
 
 from models import SimCLRMaskedViT, info_nce_loss
 from utils.datamodules import FewShotImagenetDataModule
-from utils.lr_wt_decay import param_groups_lrd
+from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
 
 
@@ -190,6 +190,12 @@ class RandMaskedSimCLR(LightningModule):
             no_weight_decay_list=("pos_embed", "cls_token"),
             layer_decay=self.layer_decay
         )
+        if self.exclude_bn_bias:
+            param_groups += exclude_from_wt_decay(self.classifier, self.weight_decay)
+        else:
+            param_groups += [
+                {"params": self.classifier.parameters(), "weight_decay": self.weight_decay}
+            ]
 
         if self.optim == "lars":
             optimizer = optim.LARS(param_groups, lr=self.learning_rate, momentum=0.9)
