@@ -532,6 +532,72 @@ class SimCLRViT(nn.Module):
         return x, proj, attn_weight
 
 
+class SimCLRMaskedViT(SimCLRViT):
+
+    @staticmethod
+    def mask_interval(x, mask_ratio, left_ratio, indices):
+        """
+        Leave $seq_len * (1 - mask_ratio)$ elements after center masking,
+        with $seq_len * left_ratio$ elements tailing in the end.
+        indices: [batch_size, seq_len]
+        """
+
+        batch_size, seq_len, embed_dim = x.size()
+        visible_len = int(seq_len * (1 - mask_ratio))
+        invisible_len = seq_len - visible_len
+        tail_len = int(seq_len * left_ratio)
+        mask_start_index = visible_len - tail_len
+        mask_end_index = mask_start_index + invisible_len
+
+        visible_indices_mask = torch.ones(seq_len, dtype=torch.bool)
+        visible_indices_mask[mask_start_index:mask_end_index] = False
+        # visible_indices_mask: [seq_len]
+        visible_indices = indices[:, visible_indices_mask]
+        # visible_indices: [batch_size, seq_len * mask_ratio]
+        expand_visible_indices = visible_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
+        # expand_visible_indices: [batch_size, seq_len * mask_ratio, embed_dim]
+        x_masked = x.gather(1, expand_visible_indices)
+        # x_masked: [batch_size, seq_len * mask_ratio, embed_dim]
+
+        return x_masked, expand_visible_indices
+
+    def first_k_mask(self, x, mask_ratio, indices):
+        """
+        Leave first $k = seq_len * (1 - mask_ratio)$ elements after masking
+        indices: [batch_size, seq_len]
+        """
+
+        return self.mask_interval(x, mask_ratio, 0., indices)
+
+    def rand_mask(self, x, mask_ratio):
+        batch_size, seq_len, embed_dim = x.size()
+        noise = torch.rand(batch_size, seq_len, device=x.device)
+        shuffled_indices = noise.argsort()
+        # shuffled_indices: [batch_size, seq_len]
+
+        return self.first_k_mask(x, mask_ratio, shuffled_indices)
+
+    def pre_encode(self, img, position, mask_ratio=0.75):
+        x = self.patch_embed(img)
+        if position:
+            x += self.pos_embed
+        # x: [batch_size, seq_len, embed_dim]
+
+        if mask_ratio > 0:
+            x, _ = self.rand_mask(x, mask_ratio)
+            # x: [batch_size, seq_len * (1 - mask_ratio), embed_dim]
+
+        return x
+
+    def forward(self, x, position=True, mask_ratio=0.):
+        x = self.pre_encode(x, position, mask_ratio)
+        x, attn_weight = self.forward_encoder(x)
+        proj = self.proj_head(x)
+        # proj: [batch_size, proj_dim]
+
+        return x, proj, attn_weight
+
+
 def info_nce_loss(feat1, feat2, temp, eps=1e-6):
     feat1 = F.normalize(feat1)
     feat2 = F.normalize(feat2)
