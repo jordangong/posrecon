@@ -20,7 +20,7 @@ from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
 
 
-class MultiHeadAttnMaskCLR(LightningModule):
+class MultiRandMaskCLR(LightningModule):
     def __init__(
             self,
             gpus: int,
@@ -45,18 +45,16 @@ class MultiHeadAttnMaskCLR(LightningModule):
             warmup_epochs: int = 10,
             max_epochs: int = 100,
             position: bool = True,
-            online_mask_ratio: float = 0.75,
-            instance_temperature: float = 1,
-            batch_temperature: float = 0.1,
+            mask_ratio: float = 0.75,
+            temperature: float = 0.1,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
-            ema_momentum: float = 0.99,
             weight_decay: float = 1e-6,
             layer_decay: float = 1.,
             **kwargs
     ):
-        super(MultiHeadAttnMaskCLR, self).__init__()
+        super(MultiRandMaskCLR, self).__init__()
         self.save_hyperparameters()
 
         self.gpus = gpus
@@ -86,13 +84,12 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.weight_decay = weight_decay
         self.layer_decay = layer_decay
         self.position = position
-        self.online_mask_ratio = online_mask_ratio
-        self.batch_temperature = batch_temperature
+        self.mask_ratio = mask_ratio
+        self.temperature = temperature
 
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
-        self.ema_momentum = ema_momentum
 
         if dataset == "imagenet":
             normalization = imagenet_normalization()
@@ -104,7 +101,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
             normalize=normalization,
         )
 
-        self.online_net = SimCLRMaskedViT(
+        self.siamese_net = SimCLRMaskedViT(
             img_size,
             patch_size,
             in_chans,
@@ -118,7 +115,6 @@ class MultiHeadAttnMaskCLR(LightningModule):
             drop_path_rate,
             partial(nn.LayerNorm, eps=1e-6),
         )
-        self.target_net = copy.deepcopy(self.online_net)
         self.classifier = nn.Linear(embed_dim, num_classes)
 
         self.train_acc_top_1 = Accuracy(top_k=1)
@@ -130,15 +126,9 @@ class MultiHeadAttnMaskCLR(LightningModule):
         global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
         self.train_iters_per_epoch = num_samples // global_batch_size
 
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        for online_p, target_p in zip(self.online_net.parameters(),
-                                      self.target_net.parameters()):
-            em = self.ema_momentum
-            target_p.data = target_p.data * em + online_p.data * (1.0 - em)
-
     def forward(self, x, position=True):
         x = self.normalization(x)
-        x, *_ = self.online_net(x, position)
+        x, *_ = self.siamese_net(x, position)
 
         return x
 
@@ -191,33 +181,19 @@ class MultiHeadAttnMaskCLR(LightningModule):
         #                                             another one for target
         crops = crops.unsqueeze(2).expand(-1, -1, num_masks + 1, *img_dim)
         # crops: [2, batch_size, num_heads+2, in_chans, height, width]
-        img = self.transform(crops.reshape(-1, *img_dim)).view_as(crops)
+        img = self.transform(crops.reshape(-1, *img_dim))
         # img: [2, batch_size, num_heads+2, in_chans, height, width]
 
-        # To fetch attention weight, forward target net first
-        img_target = img[:, :, 0].reshape(-1, *img_dim)
-        with torch.no_grad():
-            _, proj_target_, attn_weight = self.target_net(img_target, self.position)
+        reps, proj_, _ = self.siamese_net(img, self.position, self.mask_ratio)
 
-        # To mask on embedding-level
-        img_online = img[:, :, 1:].reshape(-1, *img_dim)
-        reps, proj_online_, _ = self.online_net(img_online, self.position, self.online_mask_ratio)
+        proj = F.normalize(proj_)
+        proj1, proj2 = proj.view(-1, num_masks + 1, self.proj_dim).chunk(2)
+        loss_batch_clr = self.batch_contrast_loss(proj1, proj2, self.temperature)
 
-        # Normalize and reshape for loss calculation
-        proj_target, proj_online = F.normalize(proj_target_), F.normalize(proj_online_)
-        proj_online = proj_online.view(-1, self.num_heads + 1, self.proj_dim)
-        proj1_online, proj2_online = proj_online.chunk(2)
-        proj1_target, proj2_target = proj_target.chunk(2)
-
-        # Batch-level loss, all-view contrast
-        proj1 = torch.cat((proj1_online, proj1_target.unsqueeze(1)), dim=1)
-        proj2 = torch.cat((proj2_online, proj2_target.unsqueeze(1)), dim=1)
-        loss_batch_clr = self.batch_contrast_loss(proj1, proj2, self.batch_temperature)
-
-        return reps, (proj_online_, proj_target_), loss_batch_clr
+        return reps, proj_, loss_batch_clr
 
     def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
-        labels = labels.unsqueeze(0).unsqueeze(-1).expand(2, -1, self.num_heads + 1).reshape(-1)
+        labels = labels.unsqueeze(0).unsqueeze(-1).expand(2, -1, self.num_heads + 2).reshape(-1)
         logits = self.classifier(reps)
         loss = F.cross_entropy(logits, labels)
         acc_top_1 = acc_top_1_fn(logits.softmax(-1), labels)
@@ -227,7 +203,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
     def training_step(self, batch, batch_idx):
         img, labels = batch
-        reps, proj_embed, loss = self.shared_step(img)
+        reps, proj, loss = self.shared_step(img)
 
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
             reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
@@ -239,8 +215,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
             'acc/linear_probe_top_1/train': acc_top_1,
             'acc/linear_probe_top_5/train': acc_top_5,
             'norm/reps': reps.norm(dim=-1).mean(),
-            'norm/proj_online': proj_embed[0].norm(dim=-1).mean(),
-            'norm/proj_target': proj_embed[1].norm(dim=-1).mean(),
+            'norm/proj': proj.norm(dim=-1).mean(),
         }, sync_dist=True)
         return loss + loss_xent
 
@@ -262,7 +237,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
     def configure_optimizers(self):
         param_groups = param_groups_lrd(
-            self.online_net,
+            self.siamese_net,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
             exclude_1d_params=self.exclude_bn_bias,
@@ -360,17 +335,15 @@ class MultiHeadAttnMaskCLR(LightningModule):
                             help="max steps")
         parser.add_argument("--warmup_epochs", default=10, type=int,
                             help="number of warmup epochs")
-        parser.add_argument("--ema_momentum", default=0.99, type=float,
-                            help="ema momentum")
         parser.add_argument("--batch_size", default=128, type=int,
                             help="batch size per gpu")
 
         parser.add_argument("--position", default=True, action=BooleanOptionalAction,
                             help="add positional embedding or not")
-        parser.add_argument("--online_mask_ratio", default=0.75, type=float,
-                            help="online network mask ratio of patches")
-        parser.add_argument("--batch_temperature", default=0.1, type=float,
-                            help="batch-level temperature in loss")
+        parser.add_argument("--mask_ratio", default=0.75, type=float,
+                            help="mask ratio of patches")
+        parser.add_argument("--temperature", default=0.1, type=float,
+                            help=" temperature in loss")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
                             help="weight decay")
         parser.add_argument("--layer_decay", default=1., type=float,
@@ -388,7 +361,7 @@ if __name__ == '__main__':
     parser.add_argument("--resume_ckpt_path", default=None, type=str)
     parser.add_argument("--track_grad", default=True, action=BooleanOptionalAction)
     parser.add_argument("--knn_probe", default=False, action='store_true')
-    parser = MultiHeadAttnMaskCLR.add_model_specific_args(parser)
+    parser = MultiRandMaskCLR.add_model_specific_args(parser)
     args = parser.parse_args()
 
     if args.dataset == "imagenet":
@@ -407,7 +380,7 @@ if __name__ == '__main__':
 
     dm.train_transforms = dm.val_transforms = SimCLRPretrainPreTransform(args.img_size)
 
-    model = MultiHeadAttnMaskCLR(**args.__dict__)
+    model = MultiRandMaskCLR(**args.__dict__)
 
     logger = TensorBoardLogger(args.log_path, name="pretrain", version=args.version)
     lr_monitor = LearningRateMonitor(logging_interval="step")
