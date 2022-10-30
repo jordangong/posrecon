@@ -220,9 +220,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
         pos_1to1 = proj1 @ proj1.transpose(1, 2)
         pos_1to1.diagonal(dim1=-2, dim2=-1).fill_(0)
         pos_1to2 = proj1 @ proj2.transpose(1, 2)
-        pos_1to2.diagonal(dim1=-2, dim2=-1).fill_(0)
-        pos_2to1 = proj2 @ proj1.transpose(1, 2)
-        pos_2to1.diagonal(dim1=-2, dim2=-1).fill_(0)
+        pos_2to1 = pos_1to2.permute(0, 2, 1)
         pos_2to2 = proj2 @ proj2.transpose(1, 2)
         pos_2to2.diagonal(dim1=-2, dim2=-1).fill_(0)
         # pos_{1,2}_{1,2}: [batch_size (* world_size), num_heads + 2, num_heads + 2]
