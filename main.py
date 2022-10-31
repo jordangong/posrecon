@@ -141,21 +141,23 @@ class MultiRandMaskCLR(LightningModule):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             proj = SyncFunction.apply(proj)
         # proj: [batch_size (* world_size), num_crops, proj_dim]
-        _, num_crops, proj_dim = proj.size()
-        feat = proj.view(-1, proj_dim)
-        # feat: [batch_size (* world_size) * num_crops, proj_dim]
-
-        all_sim = (feat @ feat.T).fill_diagonal_(0)
-        # all_sim: [batch_size (* world_size) * num_crops, ...]
-        all_ = torch.exp(all_sim / temp).sum(-1)
-        # all_: [batch_size (* world_size) * num_crops]
+        batch_size, num_crops, proj_dim = proj.size()
 
         pos_sim = proj @ proj.transpose(1, 2)
-        pos_sim.diagonal(dim1=-2, dim2=-1).fill_(0)
-        pos_sim = pos_sim.view(-1, num_crops)
-        # pos_sim: [batch_size (* world_size) * num_crops, num_crops]
-        pos = torch.exp(pos_sim / temp).sum(-1)
-        # pos: [batch_size (* world_size) * num_crops]
+        pos_sim = pos_sim.masked_select(~torch.eye(
+            num_crops, dtype=torch.bool, device=proj.device
+        ))
+        pos_sim = pos_sim.view(batch_size * num_crops, -1)
+        pos = torch.exp(pos_sim / temp)
+
+        neg_sim = []
+        for pos_idx in torch.eye(batch_size, dtype=torch.bool):
+            neg_sim.append(proj[pos_idx].squeeze(0)
+                           @ proj[~pos_idx].view(-1, proj_dim).T)
+        neg_sim = torch.stack(neg_sim).view(batch_size * num_crops, -1)
+        neg = torch.exp(neg_sim / temp).sum(-1)
+
+        all_ = pos + neg.unsqueeze(-1)
 
         loss = -torch.log(pos / all_).mean()
 
