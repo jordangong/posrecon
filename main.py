@@ -17,7 +17,7 @@ from torchmetrics import Accuracy
 from models import SyncFunction, SimCLRMaskedViT
 from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
-from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
+from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, MultiCropPretrainPreTransform
 
 
 class MultiRandMaskCLR(LightningModule):
@@ -133,60 +133,46 @@ class MultiRandMaskCLR(LightningModule):
         return x
 
     @staticmethod
-    def batch_contrast_loss(proj1, proj2, temp):
+    def batch_contrast_loss(proj, temp):
         # Batch-level contrast (all views), similar to InfoNCE but with more positive pairs
         # positive pairs: all instance-level pairs = 2 * (num_heads+2)^2 * batch_size
+        # swap batch size to the first, make it easier for all_gather
+        proj = proj.transpose(0, 1).contiguous()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            proj1 = SyncFunction.apply(proj1)
-            proj2 = SyncFunction.apply(proj1)
-        # proj1: [batch_size (* world_size), num_heads + 2, proj_dim]
-        # proj2: [batch_size (* world_size), num_heads + 2, proj_dim]
-        # sim_instance: [batch_size*2 (* world_size), num_heads + 2, num_heads + 2]
-        _, num_masks, proj_dim = proj1.size()
-        feat = torch.cat((proj1.view(-1, proj_dim), proj2.view(-1, proj_dim)))
-        # feat: [batch_size (* world_size) * (num_heads + 2) * 2, proj_dim]
+            proj = SyncFunction.apply(proj)
+        # proj: [batch_size (* world_size), num_crops, proj_dim]
+        _, num_crops, proj_dim = proj.size()
+        feat = proj.view(-1, proj_dim)
+        # feat: [batch_size (* world_size) * num_crops, proj_dim]
 
         all_sim = (feat @ feat.T).fill_diagonal_(0)
-        # all_sim: [batch_size (* world_size) * (num_heads + 2) * 2, ...]
+        # all_sim: [batch_size (* world_size) * num_crops, ...]
         all_ = torch.exp(all_sim / temp).sum(-1)
-        # all_: [batch_size (* world_size) * (num_heads + 2) * 2]
+        # all_: [batch_size (* world_size) * num_crops]
 
-        pos_1to1 = proj1 @ proj1.transpose(1, 2)
-        pos_1to1.diagonal(dim1=-2, dim2=-1).fill_(0)
-        pos_1to2 = proj1 @ proj2.transpose(1, 2)
-        pos_2to1 = pos_1to2.permute(0, 2, 1)
-        pos_2to2 = proj2 @ proj2.transpose(1, 2)
-        pos_2to2.diagonal(dim1=-2, dim2=-1).fill_(0)
-        # pos_{1,2}_{1,2}: [batch_size (* world_size), num_heads + 2, num_heads + 2]
-        pos_sim = torch.cat((
-            torch.cat((pos_1to1, pos_1to2), dim=2).view(-1, 2 * num_masks),
-            torch.cat((pos_2to1, pos_2to2), dim=2).view(-1, 2 * num_masks),
-        ))
-        # pos_sim: [batch_size (* world_size) * (num_heads + 2) * 2, (num_heads + 2) * 2]
+        pos_sim = proj @ proj.transpose(1, 2)
+        pos_sim.diagonal(dim1=-2, dim2=-1).fill_(0)
+        pos_sim = pos_sim.view(-1, num_crops)
+        # pos_sim: [batch_size (* world_size) * num_crops, num_crops]
         pos = torch.exp(pos_sim / temp).sum(-1)
-        # pos: [batch_size (* world_size) * (num_heads + 2) * 2]
+        # pos: [batch_size (* world_size) * num_crops]
 
         loss = -torch.log(pos / all_).mean()
 
         return loss
 
     def shared_step(self, img):
-        crop1, crop2 = img
-        batch_size, *img_dim = crop1.size()
-        crops = torch.stack((crop1, crop2))
-        # crops: [2, batch_size, in_chans, height, width]
-        num_masks = self.num_heads + 1  # Last one for attention mean
-        #                                             another one for target
-        crops = crops.unsqueeze(2).expand(-1, -1, num_masks + 1, *img_dim)
-        # crops: [2, batch_size, num_heads+2, in_chans, height, width]
+        crops = torch.stack(img)
+        # crops: [num_crops, batch_size, in_chans, height, width]
+        num_crops, batch_size, *img_dim = crops.size()
         img = self.transform(crops.reshape(-1, *img_dim))
-        # img: [2, batch_size, num_heads+2, in_chans, height, width]
+        # img: [num_crops, batch_size, in_chans, height, width]
 
         reps, proj_, _ = self.siamese_net(img, self.position, self.mask_ratio)
 
         proj = F.normalize(proj_)
-        proj1, proj2 = proj.view(-1, num_masks + 1, self.proj_dim).chunk(2)
-        loss_batch_clr = self.batch_contrast_loss(proj1, proj2, self.temperature)
+        proj = proj.view(num_crops, batch_size, self.proj_dim)
+        loss_batch_clr = self.batch_contrast_loss(proj, self.temperature)
 
         return reps, proj_, loss_batch_clr
 
@@ -277,8 +263,14 @@ class MultiRandMaskCLR(LightningModule):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
 
         # model params
-        parser.add_argument("--img_size", default=224, type=int,
-                            help="input image size")
+        parser.add_argument("--size_crops", default=(224,), type=int, nargs="+",
+                            help="crop resolution")
+        parser.add_argument("--num_crops", default=(2,), type=int, nargs="+",
+                            help="number of crops")
+        parser.add_argument("--min_scale_crops", default=(0.14,), type=float, nargs="+",
+                            help="RandResizeCrop minimum scales")
+        parser.add_argument("--max_scale_crops", default=(1.,), type=float, nargs="+",
+                            help="RandResizeCrop maximum scales")
         parser.add_argument("--patch_size", default=16, type=int,
                             help="patch size")
         parser.add_argument("--in_chans", default=3, type=int,
@@ -376,7 +368,9 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError(f"Unimplemented dataset: {args.dataset}")
 
-    dm.train_transforms = dm.val_transforms = SimCLRPretrainPreTransform(args.img_size)
+    dm.train_transforms = dm.val_transforms = MultiCropPretrainPreTransform(
+        args.size_crops, args.num_crops, args.min_scale_crops, args.max_scale_crops
+    )
 
     model = MultiRandMaskCLR(**args.__dict__)
 

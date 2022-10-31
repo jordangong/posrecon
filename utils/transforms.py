@@ -8,19 +8,27 @@ from torch import Tensor, nn
 from torchvision import transforms
 
 
-class SimCLRPretrainPreTransform:
-    def __init__(self, img_size: int = 224):
-        self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(img_size),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor(),
-        ])
+class MultiCropPretrainPreTransform:
+    def __init__(
+            self,
+            size_crops: tuple[int, ...] = (224,),
+            num_crops: tuple[int, ...] = (2,),
+            min_scale_crops: tuple[float, ...] = (0.14,),
+            max_scale_crops: tuple[float, ...] = (1.,),
+    ):
+        trans = []
+        for i in range(len(size_crops)):
+            trans += [transforms.Compose([
+                transforms.RandomResizedCrop(
+                    size_crops[i],
+                    scale=(min_scale_crops[i], max_scale_crops[i]),
+                ),
+                transforms.ToTensor(),
+            ])] * num_crops[i]
+        self.transform = trans
 
     def __call__(self, x):
-        x_1 = self.transform(x)
-        x_2 = self.transform(x)
-
-        return x_1, x_2
+        return list(map(lambda trans: trans(x), self.transform))
 
 
 def imagenet_normalization():
@@ -152,6 +160,7 @@ class SimCLRPretrainPostTransform(nn.Module):
         self.normalize = normalize
 
         data_transforms = [
+            K.RandomHorizontalFlip(p=0.5),
             K.ColorJitter(
                 brightness=0.8 * self.jitter_strength,
                 contrast=0.8 * self.jitter_strength,
