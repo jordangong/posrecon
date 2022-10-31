@@ -1,3 +1,4 @@
+import copy
 from argparse import ArgumentParser, BooleanOptionalAction
 from functools import partial
 
@@ -49,6 +50,7 @@ class RandMaskedSimCLR(LightningModule):
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
+            ema_momentum: float = 0.,
             weight_decay: float = 1e-6,
             layer_decay: float = 1.,
             **kwargs
@@ -89,6 +91,7 @@ class RandMaskedSimCLR(LightningModule):
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
+        self.ema_momentum = ema_momentum
 
         if dataset == "imagenet":
             normalization = imagenet_normalization()
@@ -114,6 +117,8 @@ class RandMaskedSimCLR(LightningModule):
             drop_path_rate,
             partial(nn.LayerNorm, eps=1e-6),
         )
+        if ema_momentum > 0:
+            self.siamese_net_sg = copy.deepcopy(self.siamese_net)
         self.classifier = nn.Linear(embed_dim, num_classes)
 
         self.train_acc_top_1 = Accuracy(top_k=1)
@@ -125,6 +130,13 @@ class RandMaskedSimCLR(LightningModule):
         global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
         self.train_iters_per_epoch = num_samples // global_batch_size
 
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if self.ema_momentum > 0:
+            for online_p, target_p in zip(self.siamese_net.parameters(),
+                                          self.siamese_net_sg.parameters()):
+                em = self.ema_momentum
+                target_p.data = target_p.data * em + online_p.data * (1.0 - em)
+
     def forward(self, x, position=True):
         x = self.normalization(x)
         x, *_ = self.siamese_net(x, position)
@@ -134,7 +146,17 @@ class RandMaskedSimCLR(LightningModule):
     def shared_step(self, img):
         img = self.transform(torch.cat(img))
         reps, proj, _ = self.siamese_net(img, self.position, self.mask_ratio)
-        loss = info_nce_loss(*proj.chunk(2), self.temperature)
+        if self.ema_momentum > 0:
+            with torch.no_grad():
+                _, proj_sg, _ = self.siamese_net_sg(img, self.position, self.mask_ratio)
+
+            proj1, proj2 = proj.chunk(2)
+            proj1_sg, proj2_sg = proj_sg.chunk(2)
+            loss_a = info_nce_loss(proj1, proj2_sg, self.temperature)
+            loss_b = info_nce_loss(proj2, proj1_sg, self.temperature)
+            loss = (loss_a + loss_b) / 2
+        else:
+            loss = info_nce_loss(*proj.chunk(2), self.temperature)
 
         return reps, proj, loss
 
@@ -281,6 +303,8 @@ class RandMaskedSimCLR(LightningModule):
                             help="max steps")
         parser.add_argument("--warmup_epochs", default=10, type=int,
                             help="number of warmup epochs")
+        parser.add_argument("--ema_momentum", default=0., type=float,
+                            help="ema momentum")
         parser.add_argument("--batch_size", default=128, type=int,
                             help="batch size per gpu")
 
