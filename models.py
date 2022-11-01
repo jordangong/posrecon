@@ -3,10 +3,10 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 from pl_bolts.models.self_supervised.resnets import Bottleneck, ResNet
-from timm.models.vision_transformer import PatchEmbed, Block, Attention
+from timm.models.vision_transformer import Block, Attention
 from torch import nn
 
-from utils.pos_embed import get_2d_sincos_pos_embed
+from utils.pos_embed import get_2d_sincos_pos_embed, interpolate_pos_encoding
 
 
 class SyncFunction(torch.autograd.Function):
@@ -532,6 +532,41 @@ class SimCLRViT(nn.Module):
         return x, proj, attn_weight
 
 
+class PatchEmbed(nn.Module):
+    """
+    2D Image to Patch Embedding
+    Modified and simplified from timm library for resolution adaptation
+    """
+
+    def __init__(
+            self,
+            img_size=224,
+            patch_size=16,
+            in_chans=3,
+            embed_dim=768,
+            norm_layer=None,
+            flatten=True,
+            bias=True,
+    ):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = (img_size // patch_size, img_size // patch_size)
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        self.flatten = flatten
+
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias)
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = self.proj(x)
+        if self.flatten:
+            x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
+        x = self.norm(x)
+        return x
+
+
 class SimCLRMaskedViT(SimCLRViT):
 
     @staticmethod
@@ -580,7 +615,11 @@ class SimCLRMaskedViT(SimCLRViT):
     def pre_encode(self, img, position, mask_ratio=0.75):
         x = self.patch_embed(img)
         if position:
-            x += self.pos_embed
+            if x.size(1) < self.pos_embed.size(1):
+                pos_embed = interpolate_pos_encoding(x, self.pos_embed)
+            else:
+                pos_embed = self.pos_embed
+            x += pos_embed
         # x: [batch_size, seq_len, embed_dim]
 
         if mask_ratio > 0:

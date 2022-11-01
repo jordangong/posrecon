@@ -163,17 +163,29 @@ class MultiRandMaskCLR(LightningModule):
 
         return loss
 
-    def shared_step(self, img):
-        crops = torch.stack(img)
-        # crops: [num_crops, batch_size, in_chans, height, width]
-        num_crops, batch_size, *img_dim = crops.size()
-        img = self.transform(crops.reshape(-1, *img_dim))
-        # img: [num_crops, batch_size, in_chans, height, width]
+    def forward_multi_crop(self, img):
+        # Concatenate crop with the same size, augment, and forward
+        img_sizes = torch.tensor([i.size(-1) for i in img])
+        end_indices = img_sizes.unique_consecutive(return_counts=True)[-1].cumsum(0)
+        start_indices = torch.cat((torch.tensor([0]), end_indices[:-1]))
+        for i, (start_index, end_index) in enumerate(zip(start_indices, end_indices)):
+            # Assume global crop at first
+            mask_ratio = self.mask_ratio if i == 0 else 0.
+            img_ = torch.cat(img[start_index:end_index])
+            img_ = self.transform(img_)
+            yield self.siamese_net(img_, self.position, mask_ratio)
 
-        reps, proj_, _ = self.siamese_net(img, self.position, self.mask_ratio)
+    def shared_step(self, img: list[torch.Tensor]):
+        num_crops = len(img)
+        reps, proj_ = [], []
+        for reps_, proj__, _ in self.forward_multi_crop(img):
+            reps.append(reps_)
+            proj_.append(proj__)
+        reps = torch.cat(reps)
+        proj_ = torch.cat(proj_)
 
         proj = F.normalize(proj_)
-        proj = proj.view(num_crops, batch_size, self.proj_dim)
+        proj = proj.view(num_crops, -1, self.proj_dim)
         loss_batch_clr = self.batch_contrast_loss(proj, self.temperature)
 
         return reps, proj_, loss_batch_clr
