@@ -179,7 +179,6 @@ class MultiRandMaskCLR(LightningModule):
         return reps, proj_, loss_batch_clr
 
     def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
-        labels = labels.unsqueeze(0).unsqueeze(-1).expand(2, -1, self.num_heads + 2).reshape(-1)
         logits = self.classifier(reps)
         loss = F.cross_entropy(logits, labels)
         acc_top_1 = acc_top_1_fn(logits.softmax(-1), labels)
@@ -191,8 +190,10 @@ class MultiRandMaskCLR(LightningModule):
         img, labels = batch
         reps, proj, loss = self.shared_step(img)
 
+        num_crops = len(img)
+        label_expand = labels.unsqueeze(0).expand(num_crops, -1).reshape(-1)
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
-            reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
+            reps.detach(), label_expand, self.train_acc_top_1, self.train_acc_top_5
         )
 
         self.log_dict({
@@ -209,8 +210,10 @@ class MultiRandMaskCLR(LightningModule):
         img, labels = batch
         reps, _, loss = self.shared_step(img)
 
+        num_crops = len(img)
+        label_expand = labels.unsqueeze(0).expand(num_crops, -1).reshape(-1)
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
-            reps.detach(), labels, self.val_acc_top_1, self.val_acc_top_5
+            reps.detach(), label_expand, self.val_acc_top_1, self.val_acc_top_5
         )
 
         self.log_dict({
