@@ -51,6 +51,7 @@ class MultiRandMaskCLR(LightningModule):
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
+            ema_momentum: float = 0.,
             weight_decay: float = 1e-6,
             layer_decay: float = 1.,
             **kwargs
@@ -92,6 +93,7 @@ class MultiRandMaskCLR(LightningModule):
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
+        self.ema_momentum = ema_momentum
 
         if dataset == "imagenet":
             normalization = imagenet_normalization()
@@ -117,6 +119,8 @@ class MultiRandMaskCLR(LightningModule):
             drop_path_rate,
             partial(nn.LayerNorm, eps=1e-6),
         )
+        if ema_momentum > 0:
+            self.siamese_net_sg = copy.deepcopy(self.siamese_net)
         self.classifier = nn.Linear(embed_dim, num_classes)
 
         self.train_acc_top_1 = Accuracy(top_k=1)
@@ -127,6 +131,13 @@ class MultiRandMaskCLR(LightningModule):
         # compute iters per epoch
         global_batch_size = num_nodes * gpus * batch_size if gpus > 0 else batch_size
         self.train_iters_per_epoch = num_samples // global_batch_size
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        if self.ema_momentum > 0:
+            for online_p, target_p in zip(self.siamese_net.parameters(),
+                                          self.siamese_net_sg.parameters()):
+                em = self.ema_momentum
+                target_p.data = target_p.data * em + online_p.data * (1.0 - em)
 
     def forward(self, x, position=True):
         x = self.normalization(x)
@@ -175,10 +186,21 @@ class MultiRandMaskCLR(LightningModule):
         # img: [2 * num_masks * batch_size, in_chans, height, width]
 
         reps, proj_, _ = self.siamese_net(img, self.position, self.mask_ratio)
+        proj = F.normalize(proj_).view(-1, batch_size, self.proj_dim)
+        if self.ema_momentum > 0:
+            with torch.no_grad():
+                _, proj_sg_, _ = self.siamese_net_sg(img, self.position, self.mask_ratio)
 
-        proj = F.normalize(proj_)
-        proj = proj.view(-1, batch_size, self.proj_dim)
-        loss_batch_clr = self.batch_contrast_loss(proj, self.temperature)
+            proj1, proj2 = proj.chunk(2)
+            proj_sg = F.normalize(proj_sg_).view(-1, batch_size, self.proj_dim)
+            proj1_sg, proj2_sg = proj_sg.chunk(2)
+            proj_1to2 = torch.cat((proj1, proj2_sg))
+            proj_2to1 = torch.cat((proj2, proj1_sg))
+            loss_batch_clr_a = self.batch_contrast_loss(proj_1to2, self.temperature)
+            loss_batch_clr_b = self.batch_contrast_loss(proj_2to1, self.temperature)
+            loss_batch_clr = (loss_batch_clr_a + loss_batch_clr_b) / 2
+        else:
+            loss_batch_clr = self.batch_contrast_loss(proj, self.temperature)
 
         return reps, proj_, loss_batch_clr
 
@@ -328,6 +350,8 @@ class MultiRandMaskCLR(LightningModule):
                             help="max steps")
         parser.add_argument("--warmup_epochs", default=10, type=int,
                             help="number of warmup epochs")
+        parser.add_argument("--ema_momentum", default=0., type=float,
+                            help="ema momentum")
         parser.add_argument("--batch_size", default=128, type=int,
                             help="batch size per gpu")
 
