@@ -184,20 +184,27 @@ class MultiHeadAttnMaskCLR(LightningModule):
     @staticmethod
     def instance_contrast_loss(proj, temp):
         # Instance-level contrast (cross views only)
-        # positive pairs: mean attention masked (crop 1) and target (crop 2)
+        # positive pairs: mean attention masked (crop 1 & 2) and target (crop 1 & 2)
         proj = proj.transpose(0, 1).contiguous()
-        # proj: [batch_size, num_masks+1, proj_dim]
-        proj_online, proj_target = proj[:, :-1], proj[:, -1:]
-        # proj_online: [batch_size, num_masks, proj_dim]
-        # proj_target: [batch_size,         1, proj_dim]
-        all_sim = proj @ proj.transpose(1, 2)
-        all_sim.diagonal(dim1=-2, dim2=-1).fill_(0)
-        # all_sim: [batch_size, num_masks+1, num_masks+1]
-        all_ = torch.exp(all_sim / temp).sum(dim=(-2, -1))
-        # all_: [batch_size]
-        pos_sim = (proj_online[:, -1:] @ proj_target.transpose(1, 2)).squeeze()
-        # pos_sim: [batch_size]
-        pos = torch.exp(pos_sim / temp) * 2
+        batch_size, _, proj_dim = proj.size()
+        # proj: [batch_size, num_heads+4, proj_dim]
+        proj_local, proj_global = proj[:, :-4], proj[:, -4:]
+        # proj_local: [batch_size, num_heads, proj_dim]
+        # proj_global: [batch_size, 4, proj_dim]
+
+        pos_sim = proj_global @ proj_global.transpose(1, 2)
+        pos_sim = pos_sim.masked_select(~torch.eye(
+            4, dtype=torch.bool, device=proj.device
+        )).view(batch_size, 4, -1)
+        # pos_sim: [batch_size, 4, 3]
+        pos = torch.exp(pos_sim / temp)
+
+        neg_sim = proj_global @ proj_local.transpose(1, 2)
+        # neg_sim: [batch_size, 4, num_heads]
+        neg = torch.exp(neg_sim / temp).sum(-1)
+
+        all_ = pos + neg.unsqueeze(-1)
+
         loss = -torch.log(pos / all_).mean()
 
         return loss
@@ -268,8 +275,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
         # Instance-level loss, cross-view contrast
         proj1_online, proj2_online = proj_online.chunk(2)
         proj1_target, proj2_target = proj_target.chunk(2)
-        proj_1to2 = torch.cat((proj1_online, proj2_target))
-        proj_2to1 = torch.cat((proj2_online, proj1_target))
+        proj_1to2 = torch.cat((proj1_online, proj1_target, proj2_online[-1:], proj2_target))
+        proj_2to1 = torch.cat((proj2_online, proj2_target, proj1_online[-1:], proj1_target))
         loss_instance_clr_a = self.instance_contrast_loss(proj_1to2, self.instance_temperature)
         loss_instance_clr_b = self.instance_contrast_loss(proj_2to1, self.instance_temperature)
         loss_instance_clr = (loss_instance_clr_a + loss_instance_clr_b) / 2
