@@ -150,31 +150,34 @@ class MultiHeadAttnMaskCLR(LightningModule):
         """
         Multi-head attention-guided masking
         Args:
-            patch_embed: [batch_size * (num_heads + 1), seq_len, embed_dim]
-            attn_weight: [batch_size, num_heads, 1 + seq_len, 1 + seq_len]
+            patch_embed: [2 * num_masks * batch_size, seq_len, embed_dim]
+            attn_weight: [2 * batch_size, num_heads, 1 + seq_len, 1 + seq_len]
             mask_ratio: ratio of # of masked patches to # of patches
         return:
-            masked_patch_embed: [batch_size * (num_heads + 1),
+            masked_patch_embed: [2 * num_masks * batch_size,
                                  seq_len * (1 - mask_ratio), embed_dim]
         """
         _, seq_len, embed_dim = patch_embed.size()
 
         cls_attn_weight = attn_weight[:, :, 0, 1:]
-        # cls_attn_weight: [batch_size, num_heads, seq_len]
+        # cls_attn_weight: [2 * batch_size, num_heads, seq_len]
         cls_attn_head_avg_weight = cls_attn_weight.mean(1)
-        # cls_attn_head_avg_weight: [batch_size, seq_len]
-        cls_attn_weight = torch.cat((cls_attn_weight.view(-1, seq_len),
-                                     cls_attn_head_avg_weight))
-        # cls_attn_weight: [batch_size * (num_heads + 1), seq_len]
+        # cls_attn_head_avg_weight: [2 * batch_size, seq_len]
+        cls_attn_weight = torch.cat((
+            cls_attn_weight, cls_attn_head_avg_weight.unsqueeze(1)
+        ), dim=1)
+        cls_attn_weight = cls_attn_weight.view(2, -1, *cls_attn_weight.shape[1:])
+        cls_attn_weight = cls_attn_weight.transpose(1, 2).reshape(-1, seq_len)
+        # cls_attn_weight: [2 * num_masks * batch_size, seq_len]
         attn_ranked_indices = cls_attn_weight.argsort(descending=True)
 
         visible_len = int(seq_len * (1 - mask_ratio))
         visible_indices = attn_ranked_indices[:, :visible_len]
-        # visible_indices: [batch_size * (num_heads + 1), seq_len * mask_ratio]
+        # visible_indices: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio)]
         expand_visible_indices = visible_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
-        # expand_visible_indices: [batch_size * (num_heads + 1), seq_len * (1 - mask_ratio), embed_dim]
+        # expand_visible_indices: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio), embed_dim]
         masked_patch_embed = patch_embed.gather(1, expand_visible_indices)
-        # masked_patch_embed: [batch_size * (num_heads + 1), seq_len * (1 - mask_ratio), embed_dim]
+        # masked_patch_embed: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio), embed_dim]
 
         return masked_patch_embed
 
@@ -244,11 +247,13 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
         # To fetch attention weight, forward target net first
         img_target = img[:, 0].reshape(-1, *img_dim)
+        # img_online: [2 * batch_size, in_chans, height, width]
         with torch.no_grad():
             _, proj_target_, attn_weight = self.target_net(img_target, self.position)
 
         # To mask on embedding-level, manually forward online encoder
         img_online = img[:, 1:].reshape(-1, *img_dim)
+        # img_online: [2 * num_masks * batch_size, in_chans, height, width]
         patch_embed = self.online_net.pre_encode(img_online, self.position)
         masked_patch_embed = self.multi_head_attn_mask(
             patch_embed, attn_weight, self.online_mask_ratio
