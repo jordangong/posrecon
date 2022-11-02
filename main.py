@@ -46,6 +46,7 @@ class MultiRandMaskCLR(LightningModule):
             max_epochs: int = 100,
             position: bool = True,
             mask_ratio: float = 0.75,
+            num_masks: int = 1,
             temperature: float = 0.1,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
@@ -85,6 +86,7 @@ class MultiRandMaskCLR(LightningModule):
         self.layer_decay = layer_decay
         self.position = position
         self.mask_ratio = mask_ratio
+        self.num_masks = num_masks
         self.temperature = temperature
 
         self.learning_rate = learning_rate
@@ -133,38 +135,30 @@ class MultiRandMaskCLR(LightningModule):
         return x
 
     @staticmethod
-    def batch_contrast_loss(proj1, proj2, temp):
+    def batch_contrast_loss(proj, temp):
         # Batch-level contrast (all views), similar to InfoNCE but with more positive pairs
-        # positive pairs: all instance-level pairs = 2 * (num_heads+2)^2 * batch_size
+        # swap batch size to the first, make it easier for all_gather
+        proj = proj.transpose(0, 1).contiguous()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            proj1 = SyncFunction.apply(proj1)
-            proj2 = SyncFunction.apply(proj1)
-        # proj1: [batch_size (* world_size), num_heads + 2, proj_dim]
-        # proj2: [batch_size (* world_size), num_heads + 2, proj_dim]
-        # sim_instance: [batch_size*2 (* world_size), num_heads + 2, num_heads + 2]
-        _, num_masks, proj_dim = proj1.size()
-        feat = torch.cat((proj1.view(-1, proj_dim), proj2.view(-1, proj_dim)))
-        # feat: [batch_size (* world_size) * (num_heads + 2) * 2, proj_dim]
+            proj = SyncFunction.apply(proj)
+        # proj: [batch_size (* world_size), num_crops * num_masks, proj_dim]
+        batch_size, num_pos_views, proj_dim = proj.size()
 
-        all_sim = (feat @ feat.T).fill_diagonal_(0)
-        # all_sim: [batch_size (* world_size) * (num_heads + 2) * 2, ...]
-        all_ = torch.exp(all_sim / temp).sum(-1)
-        # all_: [batch_size (* world_size) * (num_heads + 2) * 2]
-
-        pos_1to1 = proj1 @ proj1.transpose(1, 2)
-        pos_1to1.diagonal(dim1=-2, dim2=-1).fill_(0)
-        pos_1to2 = proj1 @ proj2.transpose(1, 2)
-        pos_2to1 = pos_1to2.permute(0, 2, 1)
-        pos_2to2 = proj2 @ proj2.transpose(1, 2)
-        pos_2to2.diagonal(dim1=-2, dim2=-1).fill_(0)
-        # pos_{1,2}_{1,2}: [batch_size (* world_size), num_heads + 2, num_heads + 2]
-        pos_sim = torch.cat((
-            torch.cat((pos_1to1, pos_1to2), dim=2).view(-1, 2 * num_masks),
-            torch.cat((pos_2to1, pos_2to2), dim=2).view(-1, 2 * num_masks),
+        pos_sim = proj @ proj.transpose(1, 2)
+        pos_sim = pos_sim.masked_select(~torch.eye(
+            num_pos_views, dtype=torch.bool, device=proj.device
         ))
-        # pos_sim: [batch_size (* world_size) * (num_heads + 2) * 2, (num_heads + 2) * 2]
-        pos = torch.exp(pos_sim / temp).sum(-1)
-        # pos: [batch_size (* world_size) * (num_heads + 2) * 2]
+        pos_sim = pos_sim.view(batch_size * num_pos_views, -1)
+        pos = torch.exp(pos_sim / temp)
+
+        neg_sim = []
+        for pos_idx in torch.eye(batch_size, dtype=torch.bool):
+            neg_sim.append(proj[pos_idx].squeeze(0)
+                           @ proj[~pos_idx].view(-1, proj_dim).T)
+        neg_sim = torch.stack(neg_sim).view(batch_size * num_pos_views, -1)
+        neg = torch.exp(neg_sim / temp).sum(-1)
+
+        all_ = pos + neg.unsqueeze(-1)
 
         loss = -torch.log(pos / all_).mean()
 
@@ -175,23 +169,20 @@ class MultiRandMaskCLR(LightningModule):
         batch_size, *img_dim = crop1.size()
         crops = torch.stack((crop1, crop2))
         # crops: [2, batch_size, in_chans, height, width]
-        num_masks = self.num_heads + 1  # Last one for attention mean
-        #                                             another one for target
-        crops = crops.unsqueeze(2).expand(-1, -1, num_masks + 1, *img_dim)
-        # crops: [2, batch_size, num_heads+2, in_chans, height, width]
+        crops = crops.unsqueeze(1).expand(-1, self.num_masks, -1, *img_dim)
+        # crops: [2, num_masks, batch_size, in_chans, height, width]
         img = self.transform(crops.reshape(-1, *img_dim))
-        # img: [2, batch_size, num_heads+2, in_chans, height, width]
+        # img: [2 * num_masks * batch_size, in_chans, height, width]
 
         reps, proj_, _ = self.siamese_net(img, self.position, self.mask_ratio)
 
         proj = F.normalize(proj_)
-        proj1, proj2 = proj.view(-1, num_masks + 1, self.proj_dim).chunk(2)
-        loss_batch_clr = self.batch_contrast_loss(proj1, proj2, self.temperature)
+        proj = proj.view(-1, batch_size, self.proj_dim)
+        loss_batch_clr = self.batch_contrast_loss(proj, self.temperature)
 
         return reps, proj_, loss_batch_clr
 
     def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
-        labels = labels.unsqueeze(0).unsqueeze(-1).expand(2, -1, self.num_heads + 2).reshape(-1)
         logits = self.classifier(reps)
         loss = F.cross_entropy(logits, labels)
         acc_top_1 = acc_top_1_fn(logits.softmax(-1), labels)
@@ -203,8 +194,10 @@ class MultiRandMaskCLR(LightningModule):
         img, labels = batch
         reps, proj, loss = self.shared_step(img)
 
+        num_crops = len(img)
+        label_expand = labels.unsqueeze(0).expand(num_crops * self.num_masks, -1).reshape(-1)
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
-            reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
+            reps.detach(), label_expand, self.train_acc_top_1, self.train_acc_top_5
         )
 
         self.log_dict({
@@ -221,8 +214,10 @@ class MultiRandMaskCLR(LightningModule):
         img, labels = batch
         reps, _, loss = self.shared_step(img)
 
+        num_crops = len(img)
+        label_expand = labels.unsqueeze(0).expand(num_crops * self.num_masks, -1).reshape(-1)
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
-            reps.detach(), labels, self.val_acc_top_1, self.val_acc_top_5
+            reps.detach(), label_expand, self.val_acc_top_1, self.val_acc_top_5
         )
 
         self.log_dict({
@@ -340,6 +335,8 @@ class MultiRandMaskCLR(LightningModule):
                             help="add positional embedding or not")
         parser.add_argument("--mask_ratio", default=0.75, type=float,
                             help="mask ratio of patches")
+        parser.add_argument("--num_masks", default=1, type=int,
+                            help="number of masks per crop")
         parser.add_argument("--temperature", default=0.1, type=float,
                             help=" temperature in loss")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
