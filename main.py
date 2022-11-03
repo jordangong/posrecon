@@ -45,7 +45,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
             warmup_epochs: int = 10,
             max_epochs: int = 100,
             position: bool = True,
-            online_mask_ratio: float = 0.75,
+            attn_mask: bool = True,
+            mask_ratio: float = 0.75,
             instance_temperature: float = 1,
             batch_temperature: float = 0.1,
             loss_ratio: float = 1.,
@@ -87,7 +88,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.weight_decay = weight_decay
         self.layer_decay = layer_decay
         self.position = position
-        self.online_mask_ratio = online_mask_ratio
+        self.attn_mask = attn_mask
+        self.mask_ratio = mask_ratio
         self.instance_temperature = instance_temperature
         self.batch_temperature = batch_temperature
         self.loss_ratio = loss_ratio
@@ -146,7 +148,28 @@ class MultiHeadAttnMaskCLR(LightningModule):
         return x
 
     @staticmethod
-    def multi_head_attn_mask(patch_embed, attn_weight, mask_ratio):
+    def mask_first_k(patch_embed, mask_ratio, ranked_indices):
+        """
+        Leave first $k$ elements after masking, where $k = seq_len * (1 - mask_ratio)$
+        """
+        _, seq_len, embed_dim = patch_embed.size()
+        visible_len = int(seq_len * (1 - mask_ratio))
+        visible_indices = ranked_indices[:, :visible_len]
+        # visible_indices: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio)]
+        expand_visible_indices = visible_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
+        # expand_visible_indices: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio), embed_dim]
+        masked_patch_embed = patch_embed.gather(1, expand_visible_indices)
+        # masked_patch_embed: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio), embed_dim]
+        return masked_patch_embed
+
+    def multi_rand_mask(self, patch_embed, mask_ratio):
+        effective_batch_size, seq_len, embed_dim = patch_embed.size()
+        noise = torch.rand(effective_batch_size, seq_len, device=patch_embed.device)
+        shuffled_indices = noise.argsort()
+
+        return self.mask_first_k(patch_embed, mask_ratio, shuffled_indices)
+
+    def multi_head_attn_mask(self, patch_embed, attn_weight, mask_ratio):
         """
         Multi-head attention-guided masking
         Args:
@@ -171,15 +194,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
         # cls_attn_weight: [2 * num_masks * batch_size, seq_len]
         attn_ranked_indices = cls_attn_weight.argsort(descending=True)
 
-        visible_len = int(seq_len * (1 - mask_ratio))
-        visible_indices = attn_ranked_indices[:, :visible_len]
-        # visible_indices: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio)]
-        expand_visible_indices = visible_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
-        # expand_visible_indices: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio), embed_dim]
-        masked_patch_embed = patch_embed.gather(1, expand_visible_indices)
-        # masked_patch_embed: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio), embed_dim]
-
-        return masked_patch_embed
+        return self.mask_first_k(patch_embed, mask_ratio, attn_ranked_indices)
 
     @staticmethod
     def instance_contrast_loss(proj, temp):
@@ -217,7 +232,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
         proj = proj.transpose(0, 1).contiguous()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             proj = SyncFunction.apply(proj)
-        # proj: [batch_size (* world_size), num_crops * num_masks, proj_dim]
+        # proj: [batch_size (* world_size), num_crops + (num_crops * num_masks), proj_dim]
         batch_size, num_pos_views, proj_dim = proj.size()
 
         pos_sim = proj @ proj.transpose(1, 2)
@@ -263,7 +278,9 @@ class MultiHeadAttnMaskCLR(LightningModule):
         # img_online: [2 * num_masks * batch_size, in_chans, height, width]
         patch_embed = self.online_net.pre_encode(img_online, self.position)
         masked_patch_embed = self.multi_head_attn_mask(
-            patch_embed, attn_weight, self.online_mask_ratio
+            patch_embed, attn_weight, self.mask_ratio
+        ) if self.attn_mask else self.multi_rand_mask(
+            patch_embed, self.mask_ratio
         )
         reps, _ = self.online_net.forward_encoder(masked_patch_embed)
         proj_online_ = self.online_net.proj_head(reps)
@@ -452,8 +469,10 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
         parser.add_argument("--position", default=True, action=BooleanOptionalAction,
                             help="add positional embedding or not")
-        parser.add_argument("--online_mask_ratio", default=0.75, type=float,
-                            help="online network mask ratio of patches")
+        parser.add_argument("--attn_mask", default=True, action=BooleanOptionalAction,
+                            help="attention-guide masking or random masking")
+        parser.add_argument("--mask_ratio", default=0.75, type=float,
+                            help="mask ratio of patches")
         parser.add_argument("--instance_temperature", default=0.1, type=float,
                             help="instance-level temperature in loss")
         parser.add_argument("--batch_temperature", default=0.1, type=float,
