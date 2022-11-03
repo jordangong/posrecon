@@ -47,8 +47,9 @@ class MultiHeadAttnMaskCLR(LightningModule):
             position: bool = True,
             attn_mask: bool = True,
             mask_ratio: float = 0.75,
-            instance_temperature: float = 1,
+            instance_temperature: float = 0.1,
             batch_temperature: float = 0.1,
+            feat_align_temperature: float = 0.1,
             loss_ratio: float = 1.,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
@@ -92,6 +93,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.mask_ratio = mask_ratio
         self.instance_temperature = instance_temperature
         self.batch_temperature = batch_temperature
+        self.feat_align_temperature = feat_align_temperature
         self.loss_ratio = loss_ratio
 
         self.learning_rate = learning_rate
@@ -225,6 +227,23 @@ class MultiHeadAttnMaskCLR(LightningModule):
         return loss
 
     @staticmethod
+    def local_feature_alignment(proj1, proj2, temp):
+        # Contrastive feature alignment between local features from 2 crops
+        proj1 = proj1.transpose(0, 1).contiguous()
+        proj2 = proj2.transpose(0, 1).contiguous()
+        # proj{1,2}: [batch_size, num_heads, proj_dim]
+
+        all_sim = proj1 @ proj2.transpose(1, 2)
+        all_ = torch.exp(all_sim / temp).sum(-1)
+
+        pos_sim = all_sim.diagonal(dim1=-2, dim2=-1)
+        pos = torch.exp(pos_sim / temp)
+
+        loss = -torch.log(pos / all_).mean()
+
+        return loss
+
+    @staticmethod
     def batch_contrast_loss(proj, temp):
         # Batch-level contrast (all views), similar to InfoNCE but with more positive pairs
         # positive pairs: all instance-level pairs = 2 * (num_heads+2)^2 * batch_size
@@ -302,12 +321,18 @@ class MultiHeadAttnMaskCLR(LightningModule):
         proj = torch.cat((proj_online, proj_target))
         loss_batch_clr = self.batch_contrast_loss(proj, self.batch_temperature)
 
+        # Contrastive local feature alignment, prevent local projection collapse
+        loss_loc_feat_align = self.local_feature_alignment(
+            proj1_online[:-1], proj2_online[:-1], self.feat_align_temperature
+        )
+
         loss_total = (self.loss_ratio * loss_instance_clr
-                      + (1 - self.loss_ratio) * loss_batch_clr)
+                      + (1 - self.loss_ratio) * loss_batch_clr
+                      + loss_loc_feat_align)
 
         return (reps,
                 (proj_online_, proj_target_),
-                (loss_instance_clr, loss_batch_clr, loss_total))
+                (loss_instance_clr, loss_batch_clr, loss_loc_feat_align, loss_total))
 
     def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
         logits = self.classifier(reps)
@@ -331,7 +356,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.log_dict({
             'loss/instance/train': losses[0],
             'loss/batch/train': losses[1],
-            'loss/pretrain/train': losses[2],
+            'loss/feat_align/train': losses[2],
+            'loss/pretrain/train': losses[-1],
             'loss/linear_probe/train': loss_xent,
             'acc/linear_probe_top_1/train': acc_top_1,
             'acc/linear_probe_top_5/train': acc_top_5,
@@ -339,7 +365,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
             'norm/proj_online': proj_embed[0].norm(dim=-1).mean(),
             'norm/proj_target': proj_embed[1].norm(dim=-1).mean(),
         }, sync_dist=True)
-        return losses[2] + loss_xent
+        return losses[-1] + loss_xent
 
     def validation_step(self, batch, batch_idx):
         img, labels = batch
@@ -355,12 +381,13 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.log_dict({
             'loss/instance/val': losses[0],
             'loss/batch/val': losses[1],
-            'loss/pretrain/val': losses[2],
+            'loss/feat_align/val': losses[2],
+            'loss/pretrain/val': losses[-1],
             'loss/linear_probe/val': loss_xent,
             'acc/linear_probe_top_1/val': acc_top_1,
             'acc/linear_probe_top_5/val': acc_top_5,
         }, sync_dist=True)
-        return losses[2] + loss_xent
+        return losses[-1] + loss_xent
 
     def configure_optimizers(self):
         param_groups = param_groups_lrd(
@@ -477,6 +504,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
                             help="instance-level temperature in loss")
         parser.add_argument("--batch_temperature", default=0.1, type=float,
                             help="batch-level temperature in loss")
+        parser.add_argument("--feat_align_temperature", default=0.1, type=float,
+                            help="local feature alignment temperature in loss")
         parser.add_argument("--loss_ratio", default=.5, type=float,
                             help="weight of two losses")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
