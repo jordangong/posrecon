@@ -51,7 +51,9 @@ class MultiHeadAttnMaskCLR(LightningModule):
             instance_temperature: float = 0.1,
             batch_temperature: float = 0.1,
             feat_align_temperature: float = 0.1,
-            loss_ratio: float = 1.,
+            loss_ratio_instance: float = 1.,
+            loss_ratio_batch: float = 1.,
+            loss_ratio_feat_align: float = 1.,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
@@ -96,7 +98,9 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.instance_temperature = instance_temperature
         self.batch_temperature = batch_temperature
         self.feat_align_temperature = feat_align_temperature
-        self.loss_ratio = loss_ratio
+        self.loss_ratio_instance = loss_ratio_instance
+        self.loss_ratio_batch = loss_ratio_batch
+        self.loss_ratio_feat_align = loss_ratio_feat_align
 
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
@@ -359,9 +363,9 @@ class MultiHeadAttnMaskCLR(LightningModule):
             proj1_local, proj2_local, self.feat_align_temperature
         )
 
-        loss_total = (self.loss_ratio * loss_instance_clr
-                      + (1 - self.loss_ratio) * loss_batch_clr
-                      + loss_loc_feat_align)
+        loss_total = (self.loss_ratio_instance * loss_instance_clr
+                      + self.loss_ratio_batch * loss_batch_clr
+                      + self.loss_ratio_feat_align * loss_loc_feat_align)
 
         return (reps,
                 (proj_online_, proj_target_),
@@ -541,8 +545,12 @@ class MultiHeadAttnMaskCLR(LightningModule):
                             help="batch-level temperature in loss")
         parser.add_argument("--feat_align_temperature", default=0.1, type=float,
                             help="local feature alignment temperature in loss")
-        parser.add_argument("--loss_ratio", default=.5, type=float,
-                            help="weight of two losses")
+        parser.add_argument("--loss_ratio_batch", default=1., type=float,
+                            help="weight of batch-level loss")
+        parser.add_argument("--loss_ratio_instance", default=1., type=float,
+                            help="weight of instance-level loss")
+        parser.add_argument("--loss_ratio_feat_align", default=1., type=float,
+                            help="weight of feat_align loss")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
                             help="weight decay")
         parser.add_argument("--layer_decay", default=1., type=float,
