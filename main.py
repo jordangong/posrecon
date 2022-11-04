@@ -254,11 +254,14 @@ class MultiHeadAttnMaskCLR(LightningModule):
         proj1 = proj1.transpose(0, 1).contiguous()
         proj2 = proj2.transpose(0, 1).contiguous()
         # proj{1,2}: [batch_size, num_heads, proj_dim]
+        proj_local = torch.cat((proj1, proj2), dim=1)
+        # proj_local: [batch_size, num_heads * 2, proj_dim]
 
-        all_sim = proj1 @ proj2.transpose(1, 2)
+        all_sim = proj_local @ proj_local.transpose(1, 2)
+        all_sim.diagonal(dim1=-2, dim2=-1).fill_(0)
         all_ = torch.exp(all_sim / temp).sum(-1)
 
-        pos_sim = all_sim.diagonal(dim1=-2, dim2=-1)
+        pos_sim = (proj1 * proj2).sum(-1).repeat(1, 2)
         pos = torch.exp(pos_sim / temp)
 
         loss = -torch.log(pos / all_).mean()
