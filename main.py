@@ -46,6 +46,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
             max_epochs: int = 100,
             position: bool = True,
             attn_mask: bool = True,
+            feat_align_topk: int = None,
             local_mask_ratio: float = 0.75,
             global_mask_ratio: float = 0.75,
             instance_temperature: float = 0.1,
@@ -93,6 +94,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.layer_decay = layer_decay
         self.position = position
         self.attn_mask = attn_mask
+        self.feat_align_topk = feat_align_topk
         self.local_mask_ratio = local_mask_ratio
         self.global_mask_ratio = global_mask_ratio
         self.instance_temperature = instance_temperature
@@ -132,6 +134,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
             partial(nn.LayerNorm, eps=1e-6),
         )
         self.target_net = copy.deepcopy(self.online_net)
+        self.feat_aggregator = nn.Conv1d(num_heads, 1, 1)
         self.classifier = nn.Linear(embed_dim, num_classes)
 
         self.train_acc_top_1 = Accuracy(top_k=1)
@@ -228,22 +231,22 @@ class MultiHeadAttnMaskCLR(LightningModule):
     @staticmethod
     def instance_contrast_loss(proj_global, proj_local, temp):
         # Instance-level contrast (cross views only)
-        # positive pairs: mean attention masked (crop 1 & 2) and target (crop 1 & 2)
+        # positive pairs: mean attention masked, aggregated and target (crop 1 & 2)
         proj_global = proj_global.transpose(0, 1).contiguous()
         proj_local = proj_local.transpose(0, 1).contiguous()
-        batch_size, _, proj_dim = proj_global.size()
+        batch_size, num_global_views, proj_dim = proj_global.size()
         # proj_local: [batch_size, 2 * num_heads, proj_dim]
-        # proj_global: [batch_size, 4, proj_dim]
+        # proj_global: [batch_size, num_global_views, proj_dim]
 
         pos_sim = proj_global @ proj_global.transpose(1, 2)
         pos_sim = pos_sim.masked_select(~torch.eye(
-            4, dtype=torch.bool, device=proj_global.device
-        )).view(batch_size, 4, -1)
-        # pos_sim: [batch_size, 4, 3]
+            num_global_views, dtype=torch.bool, device=proj_global.device
+        )).view(batch_size, num_global_views, -1)
+        # pos_sim: [batch_size, num_global_views, 3]
         pos = torch.exp(pos_sim / temp)
 
         neg_sim = proj_global @ proj_local.transpose(1, 2)
-        # neg_sim: [batch_size, 4, 2 * num_heads]
+        # neg_sim: [batch_size, num_global_views, 2 * num_heads]
         neg = torch.exp(neg_sim / temp).sum(-1)
 
         all_ = pos + neg.unsqueeze(-1)
@@ -253,34 +256,13 @@ class MultiHeadAttnMaskCLR(LightningModule):
         return loss
 
     @staticmethod
-    def local_feature_alignment(proj1, proj2, temp):
-        # Contrastive feature alignment between local features from 2 crops
-        proj1 = proj1.transpose(0, 1).contiguous()
-        proj2 = proj2.transpose(0, 1).contiguous()
-        # proj{1,2}: [batch_size, num_heads, proj_dim]
-        proj_local = torch.cat((proj1, proj2), dim=1)
-        # proj_local: [batch_size, num_heads * 2, proj_dim]
-
-        all_sim = proj_local @ proj_local.transpose(1, 2)
-        all_sim.diagonal(dim1=-2, dim2=-1).fill_(0)
-        all_ = torch.exp(all_sim / temp).sum(-1)
-
-        pos_sim = (proj1 * proj2).sum(-1).repeat(1, 2)
-        pos = torch.exp(pos_sim / temp)
-
-        loss = -torch.log(pos / all_).mean()
-
-        return loss
-
-    @staticmethod
     def batch_contrast_loss(proj, temp):
-        # Batch-level contrast (all views), similar to InfoNCE but with more positive pairs
-        # positive pairs: all instance-level pairs = 2 * (num_heads+2)^2 * batch_size
+        # Batch-level contrast, similar to InfoNCE but with more positive pairs
         # swap batch size to the first, make it easier for all_gather
         proj = proj.transpose(0, 1).contiguous()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             proj = SyncFunction.apply(proj)
-        # proj: [batch_size (* world_size), num_crops + (num_crops * num_masks), proj_dim]
+        # proj: [batch_size (* world_size), num_crops * 2, proj_dim]
         batch_size, num_pos_views, proj_dim = proj.size()
 
         pos_sim = proj @ proj.transpose(1, 2)
@@ -298,6 +280,35 @@ class MultiHeadAttnMaskCLR(LightningModule):
         neg = torch.exp(neg_sim / temp).sum(-1)
 
         all_ = pos + neg.unsqueeze(-1)
+
+        loss = -torch.log(pos / all_).mean()
+
+        return loss
+
+    @staticmethod
+    def local_feature_alignment(proj1, proj2, temp, topk=None):
+        # Contrastive feature alignment between local features from 2 crops
+        proj1 = proj1.transpose(0, 1).contiguous()
+        proj2 = proj2.transpose(0, 1).contiguous()
+        _, _, proj_dim = proj1.size()
+        # proj{1,2}: [batch_size, num_heads, proj_dim]
+
+        pos_sim = (proj1 * proj2).sum(-1)
+        if topk is not None:
+            topk_matched_indices = pos_sim.argsort(descending=True)[:, :topk]
+            topk_matched_indices_expand = topk_matched_indices.unsqueeze(-1).expand(-1, -1, proj_dim)
+            proj1 = proj1.gather(1, topk_matched_indices_expand)
+            proj2 = proj2.gather(1, topk_matched_indices_expand)
+            pos_sim = (proj1 * proj2).sum(-1)
+        pos_sim = pos_sim.repeat(1, 2)
+        pos = torch.exp(pos_sim / temp)
+
+        proj_local = torch.cat((proj1, proj2), dim=1)
+        # proj_local: [batch_size, topk * 2, proj_dim]
+
+        all_sim = proj_local @ proj_local.transpose(1, 2)
+        all_sim.diagonal(dim1=-2, dim2=-1).fill_(0)
+        all_ = torch.exp(all_sim / temp).sum(-1)
 
         loss = -torch.log(pos / all_).mean()
 
@@ -337,41 +348,50 @@ class MultiHeadAttnMaskCLR(LightningModule):
                 self.online_net.forward_encoder(mpe)[0].view(2, -1, batch_size, self.embed_dim)
                 for mpe in masked_patch_embed
             ], dim=1).view(-1, self.embed_dim)
-        proj_online_ = self.online_net.proj_head(reps)
+        reps = reps.view(2, num_masks, -1, self.embed_dim)
+        reps_head, reps_mean_head = reps[:, :-1], reps[:, -1:]
+        reps_aggregated = self.feat_aggregator(
+            reps_head.transpose(1, 2).reshape(-1, self.num_heads, self.embed_dim)
+        ).view(2, -1, 1, self.embed_dim).transpose(1, 2)
+        reps_global = torch.cat((reps_aggregated, reps_mean_head), dim=1)
+        proj_online_ = self.online_net.proj_head(
+            torch.cat((reps_head, reps_global), dim=1).view(-1, self.embed_dim)
+        )
 
         # Normalize and reshape for loss calculation
         proj_target = F.normalize(proj_target_).view(-1, batch_size, self.proj_dim)
-        proj_online = F.normalize(proj_online_).view(-1, batch_size, self.proj_dim)
+        proj_online = F.normalize(proj_online_).view(2, -1, batch_size, self.proj_dim)
+        proj_online_head = proj_online[:, :-2].reshape(-1, batch_size, self.proj_dim)
+        proj_online_global = proj_online[:, -2:].reshape(-1, batch_size, self.proj_dim)
 
-        # Instance-level loss, cross-view contrast
-        proj1_online, proj2_online = proj_online.chunk(2)
+        # Instance-level loss, local contrast
         proj1_target, proj2_target = proj_target.chunk(2)
-        proj1_global, proj2_global = proj1_online[-1:], proj2_online[-1:]
-        proj1_local, proj2_local = proj1_online[:-1], proj2_online[:-1]
-        proj_global = torch.cat((proj1_global, proj1_target, proj2_global, proj2_target))
-        proj_local = torch.cat((proj1_local, proj2_local))
+        proj1_head, proj2_head = proj_online_head.chunk(2)
+        proj_global = torch.cat((proj_online_global, proj1_target, proj2_target))
+        proj_local = torch.cat((proj1_head, proj2_head))
         loss_instance_clr = self.instance_contrast_loss(
             proj_global, proj_local, self.instance_temperature
         )
 
-        # Batch-level loss, all-view contrast
-        proj = torch.cat((proj_online, proj_target))
+        # Batch-level loss, global contrast
+        proj = torch.cat((proj_online_global, proj_target))
         loss_batch_clr = self.batch_contrast_loss(proj, self.batch_temperature)
 
         # Contrastive local feature alignment, prevent local projection collapse
         loss_loc_feat_align = self.local_feature_alignment(
-            proj1_local, proj2_local, self.feat_align_temperature
+            proj1_head, proj2_head, self.feat_align_temperature, self.feat_align_topk
         )
 
         loss_total = (self.loss_ratio_instance * loss_instance_clr
                       + self.loss_ratio_batch * loss_batch_clr
                       + self.loss_ratio_feat_align * loss_loc_feat_align)
 
-        return (reps,
+        return (reps_global.view(-1, self.embed_dim),
                 (proj_online_, proj_target_),
                 (loss_instance_clr, loss_batch_clr, loss_loc_feat_align, loss_total))
 
     def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
+        labels = labels.repeat(4)
         logits = self.classifier(reps)
         loss = F.cross_entropy(logits, labels)
         acc_top_1 = acc_top_1_fn(logits.softmax(-1), labels)
@@ -383,11 +403,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
         img, labels = batch
         reps, proj_embed, losses = self.shared_step(img)
 
-        num_crops = len(img)
-        num_masks = self.num_heads + 1
-        label_expand = labels.unsqueeze(0).expand(num_crops * num_masks, -1).reshape(-1)
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
-            reps.detach(), label_expand, self.train_acc_top_1, self.train_acc_top_5
+            reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
         )
 
         self.log_dict({
@@ -408,11 +425,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
         img, labels = batch
         reps, _, losses = self.shared_step(img)
 
-        num_crops = len(img)
-        num_masks = self.num_heads + 1
-        label_expand = labels.unsqueeze(0).expand(num_crops * num_masks, -1).reshape(-1)
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
-            reps.detach(), label_expand, self.val_acc_top_1, self.val_acc_top_5
+            reps.detach(), labels, self.val_acc_top_1, self.val_acc_top_5
         )
 
         self.log_dict({
@@ -535,6 +549,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
                             help="add positional embedding or not")
         parser.add_argument("--attn_mask", default=True, action=BooleanOptionalAction,
                             help="attention-guide masking or random masking")
+        parser.add_argument("--feat_align_topk", default=None, type=int,
+                            help="align top-k local features")
         parser.add_argument("--local_mask_ratio", default=0.75, type=float,
                             help="mask ratio of patches for local features")
         parser.add_argument("--global_mask_ratio", default=0.75, type=float,
