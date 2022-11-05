@@ -14,7 +14,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 from torchmetrics import Accuracy
 
-from models import SimCLRViT, SyncFunction
+from models import SimCLRViT, info_nce_loss
 from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
@@ -46,14 +46,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
             max_epochs: int = 100,
             position: bool = True,
             attn_mask: bool = True,
-            local_mask_ratio: float = 0.75,
-            global_mask_ratio: float = 0.75,
-            instance_temperature: float = 0.1,
-            batch_temperature: float = 0.1,
-            feat_align_temperature: float = 0.1,
-            loss_ratio_instance: float = 1.,
-            loss_ratio_batch: float = 1.,
-            loss_ratio_feat_align: float = 1.,
+            mask_ratio: float = 0.75,
+            temperature: float = 0.1,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
@@ -93,14 +87,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.layer_decay = layer_decay
         self.position = position
         self.attn_mask = attn_mask
-        self.local_mask_ratio = local_mask_ratio
-        self.global_mask_ratio = global_mask_ratio
-        self.instance_temperature = instance_temperature
-        self.batch_temperature = batch_temperature
-        self.feat_align_temperature = feat_align_temperature
-        self.loss_ratio_instance = loss_ratio_instance
-        self.loss_ratio_batch = loss_ratio_batch
-        self.loss_ratio_feat_align = loss_ratio_feat_align
+        self.mask_ratio = mask_ratio
+        self.temperature = temperature
 
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
@@ -170,27 +158,20 @@ class MultiHeadAttnMaskCLR(LightningModule):
         # masked_patch_embed: [2 * num_masks * batch_size, seq_len * (1 - mask_ratio), embed_dim]
         return masked_patch_embed
 
-    def multi_rand_mask(self, patch_embed, mask_ratio):
+    def rand_mask(self, patch_embed, mask_ratio):
         effective_batch_size, seq_len, embed_dim = patch_embed.size()
         noise = torch.rand(effective_batch_size, seq_len, device=patch_embed.device)
         shuffled_indices = noise.argsort()
 
         return self.mask_first_k(patch_embed, mask_ratio, shuffled_indices)
 
-    def multi_head_attn_mask(
-            self,
-            patch_embed,
-            attn_weight,
-            local_mask_ratio,
-            global_mask_ratio,
-    ):
+    def attention_mask(self, patch_embed, attn_weight, mask_ratio):
         """
-        Multi-head attention-guided masking
+        Mean attention-guided masking
         Args:
-            patch_embed: [2 * num_masks * batch_size, seq_len, embed_dim]
+            patch_embed: [2 * batch_size, seq_len, embed_dim]
             attn_weight: [2 * batch_size, num_heads, 1 + seq_len, 1 + seq_len]
-            local_mask_ratio: ratio of # of masked patches to # of patches
-            global_mask_ratio: ratio of # of masked patches to # of patches
+            mask_ratio: ratio of # of masked patches to # of patches
         return:
             masked_patch_embed: [2 * num_masks * batch_size,
                                  seq_len * (1 - mask_ratio), embed_dim]
@@ -199,179 +180,45 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
         cls_attn_weight = attn_weight[:, :, 0, 1:]
         # cls_attn_weight: [2 * batch_size, num_heads, seq_len]
-        cls_attn_head_avg_weight = cls_attn_weight.mean(1, keepdim=True)
-        # cls_attn_head_avg_weight: [2 * batch_size, 1, seq_len]
-        cls_attn_weight = torch.cat((
-            cls_attn_weight, cls_attn_head_avg_weight
-        ), dim=1)
-        cls_attn_weight = cls_attn_weight.view(2, -1, *cls_attn_weight.shape[1:])
-        cls_attn_weight = cls_attn_weight.transpose(1, 2)
-        # cls_attn_weight: [2, num_masks, batch_size, seq_len]
-        attn_ranked_indices = cls_attn_weight.argsort(descending=True)
+        cls_attn_head_avg_weight = cls_attn_weight.mean(1)
+        # cls_attn_head_avg_weight: [2 * batch_size, seq_len]
+        attn_ranked_indices = cls_attn_head_avg_weight.argsort(descending=True)
 
-        if local_mask_ratio == global_mask_ratio:
-            return self.mask_first_k(
-                patch_embed, local_mask_ratio, attn_ranked_indices.reshape(-1, seq_len)
-            )
-        else:
-            patch_embed = patch_embed.view(*cls_attn_weight.shape[:-1], seq_len, embed_dim)
-            local_masked_patch_embed = self.mask_first_k(
-                patch_embed[:, :-1].reshape(-1, seq_len, embed_dim),
-                local_mask_ratio, attn_ranked_indices[:, :-1].reshape(-1, seq_len)
-            )
-            global_masked_patch_embed = self.mask_first_k(
-                patch_embed[:, -1].reshape(-1, seq_len, embed_dim),
-                global_mask_ratio, attn_ranked_indices[:, -1].view(-1, seq_len)
-            )
-            return local_masked_patch_embed, global_masked_patch_embed
-
-    @staticmethod
-    def instance_contrast_loss(proj_global, proj_local, temp):
-        # Instance-level contrast (cross views only)
-        # positive pairs: mean attention masked (crop 1 & 2) and target (crop 1 & 2)
-        proj_global = proj_global.transpose(0, 1).contiguous()
-        proj_local = proj_local.transpose(0, 1).contiguous()
-        batch_size, _, proj_dim = proj_global.size()
-        # proj_local: [batch_size, 2 * num_heads, proj_dim]
-        # proj_global: [batch_size, 4, proj_dim]
-
-        pos_sim = proj_global @ proj_global.transpose(1, 2)
-        pos_sim = pos_sim.masked_select(~torch.eye(
-            4, dtype=torch.bool, device=proj_global.device
-        )).view(batch_size, 4, -1)
-        # pos_sim: [batch_size, 4, 3]
-        pos = torch.exp(pos_sim / temp)
-
-        neg_sim = proj_global @ proj_local.transpose(1, 2)
-        # neg_sim: [batch_size, 4, 2 * num_heads]
-        neg = torch.exp(neg_sim / temp).sum(-1)
-
-        all_ = pos + neg.unsqueeze(-1)
-
-        loss = -torch.log(pos / all_).mean()
-
-        return loss
-
-    @staticmethod
-    def local_feature_alignment(proj1, proj2, temp):
-        # Contrastive feature alignment between local features from 2 crops
-        proj1 = proj1.transpose(0, 1).contiguous()
-        proj2 = proj2.transpose(0, 1).contiguous()
-        # proj{1,2}: [batch_size, num_heads, proj_dim]
-        proj_local = torch.cat((proj1, proj2), dim=1)
-        # proj_local: [batch_size, num_heads * 2, proj_dim]
-
-        all_sim = proj_local @ proj_local.transpose(1, 2)
-        all_sim.diagonal(dim1=-2, dim2=-1).fill_(0)
-        all_ = torch.exp(all_sim / temp).sum(-1)
-
-        pos_sim = (proj1 * proj2).sum(-1).repeat(1, 2)
-        pos = torch.exp(pos_sim / temp)
-
-        loss = -torch.log(pos / all_).mean()
-
-        return loss
-
-    @staticmethod
-    def batch_contrast_loss(proj, temp):
-        # Batch-level contrast (all views), similar to InfoNCE but with more positive pairs
-        # positive pairs: all instance-level pairs = 2 * (num_heads+2)^2 * batch_size
-        # swap batch size to the first, make it easier for all_gather
-        proj = proj.transpose(0, 1).contiguous()
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            proj = SyncFunction.apply(proj)
-        # proj: [batch_size (* world_size), num_crops + (num_crops * num_masks), proj_dim]
-        batch_size, num_pos_views, proj_dim = proj.size()
-
-        pos_sim = proj @ proj.transpose(1, 2)
-        pos_sim = pos_sim.masked_select(~torch.eye(
-            num_pos_views, dtype=torch.bool, device=proj.device
-        ))
-        pos_sim = pos_sim.view(batch_size * num_pos_views, -1)
-        pos = torch.exp(pos_sim / temp)
-
-        neg_sim = []
-        for pos_idx in torch.eye(batch_size, dtype=torch.bool):
-            neg_sim.append(proj[pos_idx].squeeze(0)
-                           @ proj[~pos_idx].view(-1, proj_dim).T)
-        neg_sim = torch.stack(neg_sim).view(batch_size * num_pos_views, -1)
-        neg = torch.exp(neg_sim / temp).sum(-1)
-
-        all_ = pos + neg.unsqueeze(-1)
-
-        loss = -torch.log(pos / all_).mean()
-
-        return loss
+        return self.mask_first_k(patch_embed, mask_ratio, attn_ranked_indices)
 
     def shared_step(self, img):
-        crop1, crop2 = img
-        batch_size, *img_dim = crop1.size()
-        crops = torch.stack((crop1, crop2))
-        # crops: [2, batch_size, in_chans, height, width]
-        num_masks = self.num_heads + 1  # Last one for attention mean
-        #                                 another one for target
-        crops = crops.unsqueeze(1).expand(-1, num_masks + 1, -1, *img_dim)
-        # crops: [2, num_masks+1, batch_size, in_chans, height, width]
-        img = self.transform(crops.reshape(-1, *img_dim)).view_as(crops)
-        # img: [2, num_masks+1, batch_size, in_chans, height, width]
+        img = torch.cat(img)
+        # img: [2 * batch_size, in_chans, height, width]
+
+        # Perform intensity augmentation separately, this will save some memory
+        img_target = self.transform(img)
+        img_online = self.transform(img)
+        # img_{online, target}: [2 * batch_size, in_chans, height, width]
 
         # To fetch attention weight, forward target net first
-        img_target = img[:, 0].reshape(-1, *img_dim)
-        # img_online: [2 * batch_size, in_chans, height, width]
         with torch.no_grad():
             _, proj_target_, attn_weight = self.target_net(img_target, self.position)
 
         # To mask on embedding-level, manually forward online encoder
-        img_online = img[:, 1:].reshape(-1, *img_dim)
-        # img_online: [2 * num_masks * batch_size, in_chans, height, width]
         patch_embed = self.online_net.pre_encode(img_online, self.position)
-        masked_patch_embed = self.multi_head_attn_mask(
-            patch_embed, attn_weight, self.local_mask_ratio, self.global_mask_ratio,
-        ) if self.attn_mask else self.multi_rand_mask(
-            patch_embed, self.local_mask_ratio
+        masked_patch_embed = self.attention_mask(
+            patch_embed, attn_weight, self.mask_ratio
+        ) if self.attn_mask else self.rand_mask(
+            patch_embed, self.mask_ratio
         )
-        if isinstance(masked_patch_embed, torch.Tensor):
-            reps, _ = self.online_net.forward_encoder(masked_patch_embed)
-        else:
-            reps = torch.cat([
-                self.online_net.forward_encoder(mpe)[0].view(2, -1, batch_size, self.embed_dim)
-                for mpe in masked_patch_embed
-            ], dim=1).view(-1, self.embed_dim)
+        reps, _ = self.online_net.forward_encoder(masked_patch_embed)
         proj_online_ = self.online_net.proj_head(reps)
 
-        # Normalize and reshape for loss calculation
-        proj_target = F.normalize(proj_target_).view(-1, batch_size, self.proj_dim)
-        proj_online = F.normalize(proj_online_).view(-1, batch_size, self.proj_dim)
+        proj1_target, proj2_target = proj_target_.chunk(2)
+        proj1_online, proj2_online = proj_online_.chunk(2)
+        loss_1to2 = info_nce_loss(proj1_online, proj2_target, self.temperature)
+        loss_2to1 = info_nce_loss(proj2_online, proj1_target, self.temperature)
+        loss = (loss_1to2 + loss_2to1) / 2
 
-        # Instance-level loss, cross-view contrast
-        proj1_online, proj2_online = proj_online.chunk(2)
-        proj1_target, proj2_target = proj_target.chunk(2)
-        proj1_global, proj2_global = proj1_online[-1:], proj2_online[-1:]
-        proj1_local, proj2_local = proj1_online[:-1], proj2_online[:-1]
-        proj_global = torch.cat((proj1_global, proj1_target, proj2_global, proj2_target))
-        proj_local = torch.cat((proj1_local, proj2_local))
-        loss_instance_clr = self.instance_contrast_loss(
-            proj_global, proj_local, self.instance_temperature
-        )
-
-        # Batch-level loss, all-view contrast
-        proj = torch.cat((proj_online, proj_target))
-        loss_batch_clr = self.batch_contrast_loss(proj, self.batch_temperature)
-
-        # Contrastive local feature alignment, prevent local projection collapse
-        loss_loc_feat_align = self.local_feature_alignment(
-            proj1_local, proj2_local, self.feat_align_temperature
-        )
-
-        loss_total = (self.loss_ratio_instance * loss_instance_clr
-                      + self.loss_ratio_batch * loss_batch_clr
-                      + self.loss_ratio_feat_align * loss_loc_feat_align)
-
-        return (reps,
-                (proj_online_, proj_target_),
-                (loss_instance_clr, loss_batch_clr, loss_loc_feat_align, loss_total))
+        return reps, (proj_online_, proj_target_), loss
 
     def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
+        labels = labels.repeat(2)
         logits = self.classifier(reps)
         loss = F.cross_entropy(logits, labels)
         acc_top_1 = acc_top_1_fn(logits.softmax(-1), labels)
@@ -381,20 +228,14 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
     def training_step(self, batch, batch_idx):
         img, labels = batch
-        reps, proj_embed, losses = self.shared_step(img)
+        reps, proj_embed, loss = self.shared_step(img)
 
-        num_crops = len(img)
-        num_masks = self.num_heads + 1
-        label_expand = labels.unsqueeze(0).expand(num_crops * num_masks, -1).reshape(-1)
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
-            reps.detach(), label_expand, self.train_acc_top_1, self.train_acc_top_5
+            reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
         )
 
         self.log_dict({
-            'loss/instance/train': losses[0],
-            'loss/batch/train': losses[1],
-            'loss/feat_align/train': losses[2],
-            'loss/pretrain/train': losses[-1],
+            'loss/pretrain/train': loss,
             'loss/linear_probe/train': loss_xent,
             'acc/linear_probe_top_1/train': acc_top_1,
             'acc/linear_probe_top_5/train': acc_top_5,
@@ -402,29 +243,23 @@ class MultiHeadAttnMaskCLR(LightningModule):
             'norm/proj_online': proj_embed[0].norm(dim=-1).mean(),
             'norm/proj_target': proj_embed[1].norm(dim=-1).mean(),
         }, sync_dist=True)
-        return losses[-1] + loss_xent
+        return loss + loss_xent
 
     def validation_step(self, batch, batch_idx):
         img, labels = batch
-        reps, _, losses = self.shared_step(img)
+        reps, _, loss = self.shared_step(img)
 
-        num_crops = len(img)
-        num_masks = self.num_heads + 1
-        label_expand = labels.unsqueeze(0).expand(num_crops * num_masks, -1).reshape(-1)
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
-            reps.detach(), label_expand, self.val_acc_top_1, self.val_acc_top_5
+            reps.detach(), labels, self.val_acc_top_1, self.val_acc_top_5
         )
 
         self.log_dict({
-            'loss/instance/val': losses[0],
-            'loss/batch/val': losses[1],
-            'loss/feat_align/val': losses[2],
-            'loss/pretrain/val': losses[-1],
+            'loss/pretrain/val': loss,
             'loss/linear_probe/val': loss_xent,
             'acc/linear_probe_top_1/val': acc_top_1,
             'acc/linear_probe_top_5/val': acc_top_5,
         }, sync_dist=True)
-        return losses[-1] + loss_xent
+        return loss + loss_xent
 
     def configure_optimizers(self):
         param_groups = param_groups_lrd(
@@ -535,22 +370,10 @@ class MultiHeadAttnMaskCLR(LightningModule):
                             help="add positional embedding or not")
         parser.add_argument("--attn_mask", default=True, action=BooleanOptionalAction,
                             help="attention-guide masking or random masking")
-        parser.add_argument("--local_mask_ratio", default=0.75, type=float,
-                            help="mask ratio of patches for local features")
-        parser.add_argument("--global_mask_ratio", default=0.75, type=float,
-                            help="mask ratio of patches for global features")
-        parser.add_argument("--instance_temperature", default=0.1, type=float,
-                            help="instance-level temperature in loss")
-        parser.add_argument("--batch_temperature", default=0.1, type=float,
-                            help="batch-level temperature in loss")
-        parser.add_argument("--feat_align_temperature", default=0.1, type=float,
-                            help="local feature alignment temperature in loss")
-        parser.add_argument("--loss_ratio_batch", default=1., type=float,
-                            help="weight of batch-level loss")
-        parser.add_argument("--loss_ratio_instance", default=1., type=float,
-                            help="weight of instance-level loss")
-        parser.add_argument("--loss_ratio_feat_align", default=1., type=float,
-                            help="weight of feat_align loss")
+        parser.add_argument("--mask_ratio", default=0.75, type=float,
+                            help="mask ratio of patches")
+        parser.add_argument("--temperature", default=0.1, type=float,
+                            help="atch-level temperature in loss")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
                             help="weight decay")
         parser.add_argument("--layer_decay", default=1., type=float,
