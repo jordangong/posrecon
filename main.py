@@ -47,6 +47,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
             position: bool = True,
             attn_mask: bool = True,
             mask_ratio: float = 0.75,
+            mask_mode: str = "low",
             temperature: float = 0.1,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
@@ -88,6 +89,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.position = position
         self.attn_mask = attn_mask
         self.mask_ratio = mask_ratio
+        self.mask_mode = mask_mode
         self.temperature = temperature
 
         self.learning_rate = learning_rate
@@ -165,7 +167,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
         return self.mask_first_k(patch_embed, mask_ratio, shuffled_indices)
 
-    def attention_mask(self, patch_embed, attn_weight, mask_ratio):
+    def attention_mask(self, patch_embed, attn_weight, mask_ratio, mask_mode):
         """
         Mean attention-guided masking
         Args:
@@ -182,7 +184,9 @@ class MultiHeadAttnMaskCLR(LightningModule):
         # cls_attn_weight: [2 * batch_size, num_heads, seq_len]
         cls_attn_head_avg_weight = cls_attn_weight.mean(1)
         # cls_attn_head_avg_weight: [2 * batch_size, seq_len]
-        attn_ranked_indices = cls_attn_head_avg_weight.argsort(descending=True)
+        attn_ranked_indices = cls_attn_head_avg_weight.argsort(
+            descending=(True if mask_mode == "low" else False)
+        )
 
         return self.mask_first_k(patch_embed, mask_ratio, attn_ranked_indices)
 
@@ -202,7 +206,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
         # To mask on embedding-level, manually forward online encoder
         patch_embed = self.online_net.pre_encode(img_online, self.position)
         masked_patch_embed = self.attention_mask(
-            patch_embed, attn_weight, self.mask_ratio
+            patch_embed, attn_weight, self.mask_ratio, self.mask_mode
         ) if self.attn_mask else self.rand_mask(
             patch_embed, self.mask_ratio
         )
@@ -370,6 +374,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
                             help="add positional embedding or not")
         parser.add_argument("--attn_mask", default=True, action=BooleanOptionalAction,
                             help="attention-guide masking or random masking")
+        parser.add_argument("--mask_mode", default="low", type=str,
+                            help="mask low or high attention patches")
         parser.add_argument("--mask_ratio", default=0.75, type=float,
                             help="mask ratio of patches")
         parser.add_argument("--temperature", default=0.1, type=float,
