@@ -14,7 +14,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 from torchmetrics import Accuracy
 
-from models import SimCLRMaskedViT, info_nce_loss
+from models import SimCLRMaskedViT, info_nce_loss, cov_reg_loss
 from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
@@ -46,7 +46,9 @@ class RandMaskedSimCLR(LightningModule):
             max_epochs: int = 100,
             position: bool = True,
             mask_ratio: float = 0.75,
+            mask_ratio_sg: float = 0.75,
             temperature: float = 0.1,
+            loss_ratio: float = 1.,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
@@ -86,7 +88,9 @@ class RandMaskedSimCLR(LightningModule):
         self.layer_decay = layer_decay
         self.position = position
         self.mask_ratio = mask_ratio
+        self.mask_ratio_sg = mask_ratio_sg
         self.temperature = temperature
+        self.loss_ratio = loss_ratio
 
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
@@ -146,19 +150,23 @@ class RandMaskedSimCLR(LightningModule):
     def shared_step(self, img):
         img = self.transform(torch.cat(img))
         reps, proj, _ = self.siamese_net(img, self.position, self.mask_ratio)
+        proj1, proj2 = proj.chunk(2)
         if self.ema_momentum > 0:
             with torch.no_grad():
-                _, proj_sg, _ = self.siamese_net_sg(img, self.position, self.mask_ratio)
+                _, proj_sg, _ = self.siamese_net_sg(img, self.position, self.mask_ratio_sg)
 
-            proj1, proj2 = proj.chunk(2)
             proj1_sg, proj2_sg = proj_sg.chunk(2)
-            loss_a = info_nce_loss(proj1, proj2_sg, self.temperature)
-            loss_b = info_nce_loss(proj2, proj1_sg, self.temperature)
-            loss = (loss_a + loss_b) / 2
+            loss_clr_a = info_nce_loss(proj1, proj2_sg, self.temperature)
+            loss_clr_b = info_nce_loss(proj2, proj1_sg, self.temperature)
+            loss_clr = (loss_clr_a + loss_clr_b) / 2
         else:
-            loss = info_nce_loss(*proj.chunk(2), self.temperature)
+            loss_clr = info_nce_loss(proj1, proj2, self.temperature)
 
-        return reps, proj, loss
+        loss_cov_reg = cov_reg_loss(proj1) + cov_reg_loss(proj2)
+
+        loss = loss_clr + self.loss_ratio * loss_cov_reg
+
+        return reps, proj, (loss_clr, loss_cov_reg, loss)
 
     def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
         labels = labels.repeat(2)
@@ -171,37 +179,41 @@ class RandMaskedSimCLR(LightningModule):
 
     def training_step(self, batch, batch_idx):
         img, labels = batch
-        reps, proj, loss = self.shared_step(img)
+        reps, proj, losses = self.shared_step(img)
 
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
             reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
         )
 
         self.log_dict({
-            'loss/pretrain/train': loss,
+            'loss/clr/train': losses[0],
+            'loss/cov_reg/train': losses[1],
+            'loss/pretrain/train': losses[-1],
             'loss/linear_probe/train': loss_xent,
             'acc/linear_probe_top_1/train': acc_top_1,
             'acc/linear_probe_top_5/train': acc_top_5,
             'norm/reps': reps.norm(dim=-1).mean(),
             'norm/proj': proj.norm(dim=-1).mean(),
         }, sync_dist=True)
-        return loss + loss_xent
+        return losses[-1] + loss_xent
 
     def validation_step(self, batch, batch_idx):
         img, labels = batch
-        reps, proj, loss = self.shared_step(img)
+        reps, proj, losses = self.shared_step(img)
 
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
             reps.detach(), labels, self.val_acc_top_1, self.val_acc_top_5
         )
 
         self.log_dict({
-            'loss/pretrain/val': loss,
+            'loss/clr/val': losses[0],
+            'loss/cov_reg/val': losses[1],
+            'loss/pretrain/val': losses[-1],
             'loss/linear_probe/val': loss_xent,
             'acc/linear_probe_top_1/val': acc_top_1,
             'acc/linear_probe_top_5/val': acc_top_5,
         }, sync_dist=True)
-        return loss + loss_xent
+        return losses[-1] + loss_xent
 
     def configure_optimizers(self):
         param_groups = param_groups_lrd(
@@ -312,8 +324,12 @@ class RandMaskedSimCLR(LightningModule):
                             help="add positional embedding or not")
         parser.add_argument("--mask_ratio", default=0.75, type=float,
                             help="mask ratio of patches")
+        parser.add_argument("--mask_ratio_sg", default=0.75, type=float,
+                            help="mask ratio of patches on target branch")
         parser.add_argument("--temperature", default=0.1, type=float,
                             help="temperature parameter in InfoNCE loss")
+        parser.add_argument("--loss_ratio", default=1., type=float,
+                            help="coefficient on covariance regularization loss")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
                             help="weight decay")
         parser.add_argument("--layer_decay", default=1., type=float,
