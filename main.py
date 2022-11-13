@@ -48,7 +48,8 @@ class RandMaskedSimCLR(LightningModule):
             mask_ratio: float = 0.75,
             mask_ratio_sg: float = 0.75,
             temperature: float = 0.1,
-            loss_ratio: float = 1.,
+            cov_reg_norm: bool = False,
+            loss_ratio: float = 0.,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
@@ -90,6 +91,7 @@ class RandMaskedSimCLR(LightningModule):
         self.mask_ratio = mask_ratio
         self.mask_ratio_sg = mask_ratio_sg
         self.temperature = temperature
+        self.cov_reg_norm = cov_reg_norm
         self.loss_ratio = loss_ratio
 
         self.learning_rate = learning_rate
@@ -162,7 +164,7 @@ class RandMaskedSimCLR(LightningModule):
         else:
             loss_clr = info_nce_loss(proj1, proj2, self.temperature)
 
-        loss_cov_reg = cov_reg_loss(proj1) + cov_reg_loss(proj2)
+        loss_cov_reg = cov_reg_loss(proj1, self.cov_reg_norm) + cov_reg_loss(proj2, self.cov_reg_norm)
 
         loss = loss_clr + self.loss_ratio * loss_cov_reg
 
@@ -328,7 +330,9 @@ class RandMaskedSimCLR(LightningModule):
                             help="mask ratio of patches on target branch")
         parser.add_argument("--temperature", default=0.1, type=float,
                             help="temperature parameter in InfoNCE loss")
-        parser.add_argument("--loss_ratio", default=1., type=float,
+        parser.add_argument("--cov_reg_norm", default=False, action="store_true",
+                            help="use correlation instead of covariance")
+        parser.add_argument("--loss_ratio", default=0., type=float,
                             help="coefficient on covariance regularization loss")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
                             help="weight decay")

@@ -630,13 +630,13 @@ def info_nce_loss(feat1, feat2, temp, eps=1e-6):
 
     return loss
 
-def cov_reg_loss(proj):
+def cov_reg_loss(proj, norm=False):
     _, proj_dim = proj.size()
     # proj: [batch_size, proj_dim]
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         proj = SyncFunction.apply(proj)
     # proj: [batch_size (* world_size), proj_dim]
-    proj_cov = proj.T.cov()
+    proj_cov = proj.T.corrcoef() if norm else proj.T.cov()
     off_diag_mask = ~torch.eye(
         proj_dim, dtype=torch.bool, device=proj.device
     )
