@@ -13,7 +13,7 @@ from timm.loss.cross_entropy import SoftTargetCrossEntropy
 from torch import nn
 from torchvision import transforms
 
-from main import RandMaskedBYOL
+from main import RandMaskedSimCLR
 from models import SimCLRViT
 from utils.datamodules import FewShotImagenetDataModule, CIFAR100DataModule, \
     Flowers102DataModule, OxfordIIITPetDataModule
@@ -111,7 +111,7 @@ class CLREvaluator(SSLFineTuner):
 
     def forward(self, x, position=True):
         x = self.normalization(x)
-        x = self.backbone(x, position, pretrain=False)
+        x, *_ = self.backbone(x, position)
 
         return x
 
@@ -119,9 +119,9 @@ class CLREvaluator(SSLFineTuner):
         x, y = batch
         if self.protocol == 'linear':
             with torch.no_grad():
-                feats = self.backbone(x, self.position, pretrain=False)
+                feats, *_ = self.backbone(x, self.position)
         elif self.protocol == 'finetune':
-            feats = self.backbone(x, self.position, pretrain=False)
+            feats, *_ = self.backbone(x, self.position)
 
         logits = self.linear_layer(feats)
         loss = self.criterion(logits, y)
@@ -303,10 +303,10 @@ if __name__ == "__main__":
     parser = CLREvaluator.add_model_specific_args(parser)
     args = parser.parse_args()
 
-    pretrained = RandMaskedBYOL.load_from_checkpoint(args.ckpt_path, strict=False)
+    pretrained = RandMaskedSimCLR.load_from_checkpoint(args.ckpt_path, strict=False)
     # a bit hacky here, replace ViT with dropout rate
     pretained_state_dict = pretrained.state_dict()
-    pretrained.online_net = SimCLRViT(
+    pretrained.siamese_net = SimCLRViT(
         pretrained.img_size,
         pretrained.patch_size,
         pretrained.in_chans,
@@ -360,7 +360,7 @@ if __name__ == "__main__":
         dataset=args.dataset,
         img_size=pretrained.img_size,
         position=args.position,
-        backbone=pretrained.online_net,
+        backbone=pretrained.siamese_net,
         in_features=pretrained.embed_dim,
         num_classes=dm.num_classes,
         epochs=args.max_epochs,
