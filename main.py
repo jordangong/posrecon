@@ -1,6 +1,7 @@
 import copy
 from argparse import ArgumentParser, BooleanOptionalAction
 from functools import partial
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +43,7 @@ class RandMaskedSimCLR(LightningModule):
             drop_rate: float = 0.,
             attention_drop_rate: float = 0.,
             drop_path_rate: float = 0.,
+            weight_sharing: Optional[str] = None,
             warmup_epochs: int = 10,
             max_epochs: int = 100,
             position: bool = True,
@@ -82,6 +84,7 @@ class RandMaskedSimCLR(LightningModule):
         self.drop_rate = drop_rate
         self.attention_drop_rate = attention_drop_rate
         self.drop_path_rate = drop_path_rate
+        self.weight_sharing = weight_sharing
 
         self.optim = optimizer
         self.exclude_bn_bias = exclude_bn_bias
@@ -121,7 +124,8 @@ class RandMaskedSimCLR(LightningModule):
             drop_rate,
             attention_drop_rate,
             drop_path_rate,
-            partial(nn.LayerNorm, eps=1e-6),
+            norm_layer=partial(nn.LayerNorm, eps=1e-6),
+            weight_sharing=weight_sharing
         )
         if ema_momentum > 0:
             self.siamese_net_sg = copy.deepcopy(self.siamese_net)
@@ -283,6 +287,9 @@ class RandMaskedSimCLR(LightningModule):
                             help="attention dropout rate")
         parser.add_argument("--path_dropout", default=0.0, type=float,
                             help="path dropout rate")
+        parser.add_argument("--weight_sharing", default=None, type=str,
+                            help="ALBERT-style weight sharing, "
+                                 "choose from None, attn, ffn, or all")
         parser.add_argument("--fp32", default=True, action=BooleanOptionalAction,
                             help="use fp32 or fp16")
 

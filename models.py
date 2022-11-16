@@ -1,9 +1,10 @@
-from typing import Callable
+import copy
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 from pl_bolts.models.self_supervised.resnets import Bottleneck, ResNet
-from timm.models.vision_transformer import PatchEmbed, Block, Attention
+from timm.models.vision_transformer import PatchEmbed, Block, LayerScale, DropPath
 from torch import nn
 
 from utils.pos_embed import get_2d_sincos_pos_embed
@@ -369,7 +370,20 @@ class MaskedPosReconCLRViT(nn.Module):
             return latent[:, 0, :]
 
 
-class AttentionWithWeightOutput(Attention):
+class AttentionWithWeightSharing(nn.Module):
+    def __init__(self, qkv, proj, num_heads=8, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        dim = qkv.weight.size(-1)
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = qkv
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = proj
+        self.proj_drop = nn.Dropout(proj_drop)
+
     def forward(self, x, weight_output=False):
         batch_size, seq_len, embed_dim = x.shape
         qkv = self.qkv(x)
@@ -388,26 +402,63 @@ class AttentionWithWeightOutput(Attention):
         return (x, attn_weight) if weight_output else (x, None)
 
 
-class BlockWithAttentionWeight(Block):
+class MlpWithWeightSharing(nn.Module):
+
     def __init__(
             self,
-            dim,
-            num_heads,
-            mlp_ratio=4.,
-            qkv_bias=False,
-            drop=0.,
-            attn_drop=0.,
-            attention_weight=False,
-            *args,
-            **kwargs,
+            fc1: nn.Linear,
+            fc2: nn.Linear,
+            act_layer: Callable = nn.GELU,
+            drop: float = 0.,
     ):
-        super().__init__(dim, num_heads, mlp_ratio, qkv_bias,
-                         drop, attn_drop, *args, **kwargs)
+        super().__init__()
+
+        self.fc1 = fc1
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop)
+        self.fc2 = fc2
+        self.drop2 = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
+
+
+class BlockWithWeightSharing(nn.Module):
+
+    def __init__(
+            self,
+            qkv: nn.Linear,
+            proj: nn.Linear,
+            mlp_fc1: nn.Linear,
+            mlp_fc2: nn.Linear,
+            num_heads: int,
+            drop: float = 0.,
+            attn_drop: float = 0.,
+            attention_weight: bool = False,
+            init_values: Optional[float] = None,
+            drop_path: float = 0.,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = nn.LayerNorm,
+    ):
+        super().__init__()
         self.attention_weight = attention_weight
-        self.attn = AttentionWithWeightOutput(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias,
-            attn_drop=attn_drop, proj_drop=drop
-        )
+        dim = qkv.weight.size(-1)
+        self.norm1 = norm_layer(dim)
+        self.attn = AttentionWithWeightSharing(qkv, proj, num_heads=num_heads,
+                                               attn_drop=attn_drop, proj_drop=drop)
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        self.mlp = MlpWithWeightSharing(mlp_fc1, mlp_fc2, act_layer, drop)
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
         x, attn_weight = self.attn(self.norm1(x), self.attention_weight)
@@ -432,7 +483,9 @@ class SimCLRViT(nn.Module):
             drop_rate: float = 0.,
             attention_drop_rate: float = 0.,
             drop_path_rate: float = 0.,
+            act_layer: Callable = nn.GELU,
             norm_layer: Callable = nn.LayerNorm,
+            weight_sharing: Optional[str] = None,
     ):
         """
         Args:
@@ -447,7 +500,10 @@ class SimCLRViT(nn.Module):
             drop_rate: dropout rate
             attention_drop_rate: attention dropout rate
             drop_path_rate: stochastic depth rate
+            act_layer: activation layer
             norm_layer: normalization layer
+            weight_sharing: ALBERT-like weight sharing,
+                            choose from None, attn, ffn, or all
         """
         super().__init__()
 
@@ -460,12 +516,18 @@ class SimCLRViT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim),
                                       requires_grad=False)
 
-        self.blocks = nn.Sequential(*[BlockWithAttentionWeight(
-            embed_dim, num_heads, mlp_ratio, qkv_bias=True, drop=drop_rate,
-            attn_drop=attention_drop_rate, drop_path=dpr.item(), norm_layer=norm_layer,
-            attention_weight=(True if layer == depth - 1 else False),
-        ) for layer, dpr in enumerate(torch.linspace(0, drop_path_rate, depth))
-        ])
+        self.blocks = self.build_blocks(
+            embed_dim,
+            depth,
+            num_heads,
+            mlp_ratio,
+            drop_rate,
+            attention_drop_rate,
+            drop_path_rate,
+            act_layer,
+            norm_layer,
+            weight_sharing,
+        )
         self.norm = norm_layer(embed_dim)
 
         # Projection head
@@ -477,6 +539,40 @@ class SimCLRViT(nn.Module):
         )
 
         self.init_weights()
+
+    def build_blocks(
+            self,
+            embed_dim: int = 768,
+            depth: int = 12,
+            num_heads: int = 12,
+            mlp_ratio: int = 4,
+            drop_rate: float = 0.,
+            attention_drop_rate: float = 0.,
+            drop_path_rate: float = 0.,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = nn.LayerNorm,
+            weight_sharing: Optional[str] = None,
+    ) -> nn.Module:
+        blocks = []
+        qkv = nn.Linear(embed_dim, embed_dim * 3)
+        proj = nn.Linear(embed_dim, embed_dim)
+        mlp_fc1 = nn.Linear(embed_dim, int(embed_dim * mlp_ratio))
+        mlp_fc2 = nn.Linear(int(embed_dim * mlp_ratio), embed_dim)
+        for layer, dpr in enumerate(torch.linspace(0, drop_path_rate, depth)):
+            block = BlockWithWeightSharing(
+                qkv, proj, mlp_fc1, mlp_fc2, num_heads,
+                drop=drop_rate, attn_drop=attention_drop_rate, drop_path=dpr.item(),
+                act_layer=act_layer, norm_layer=norm_layer,
+                attention_weight=(True if layer == depth - 1 else False),
+            )
+            if weight_sharing is None or weight_sharing == "attn":
+                mlp_fc1 = copy.deepcopy(mlp_fc1)
+                mlp_fc2 = copy.deepcopy(mlp_fc2)
+            if weight_sharing is None or weight_sharing == "ffn":
+                qkv = copy.deepcopy(qkv)
+                proj = copy.deepcopy(proj)
+            blocks.append(block)
+        return nn.Sequential(*blocks)
 
     def init_weights(self):
         pos_embed = get_2d_sincos_pos_embed(
@@ -629,6 +725,7 @@ def info_nce_loss(feat1, feat2, temp, eps=1e-6):
     loss = -torch.log(pos / (all_ + eps)).mean()
 
     return loss
+
 
 def cov_reg_loss(proj, norm=False):
     _, proj_dim = proj.size()
