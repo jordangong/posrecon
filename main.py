@@ -14,7 +14,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 from torchmetrics import Accuracy
 
-from models import SimCLRViT, info_nce_loss
+from models import SimCLRViT, info_nce_loss, cov_reg_loss
 from utils.datamodules import FewShotImagenetDataModule
 from utils.lr_wt_decay import param_groups_lrd, exclude_from_wt_decay
 from utils.transforms import SimCLRPretrainPostTransform, imagenet_normalization, SimCLRPretrainPreTransform
@@ -49,6 +49,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
             mask_ratio: float = 0.75,
             mask_mode: str = "low",
             temperature: float = 0.1,
+            cov_reg_norm: bool = False,
+            loss_ratio: float = 0.,
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
@@ -91,6 +93,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.mask_ratio = mask_ratio
         self.mask_mode = mask_mode
         self.temperature = temperature
+        self.cov_reg_norm = cov_reg_norm
+        self.loss_ratio = loss_ratio
 
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
@@ -215,11 +219,17 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
         proj1_target, proj2_target = proj_target_.chunk(2)
         proj1_online, proj2_online = proj_online_.chunk(2)
-        loss_1to2 = info_nce_loss(proj1_online, proj2_target, self.temperature)
-        loss_2to1 = info_nce_loss(proj2_online, proj1_target, self.temperature)
-        loss = (loss_1to2 + loss_2to1) / 2
+        loss_clr_1to2 = info_nce_loss(proj1_online, proj2_target, self.temperature)
+        loss_clr_2to1 = info_nce_loss(proj2_online, proj1_target, self.temperature)
+        loss_clr = (loss_clr_1to2 + loss_clr_2to1) / 2
 
-        return reps, (proj_online_, proj_target_), loss
+        loss_cov_reg_1 = cov_reg_loss(proj1_online, self.cov_reg_norm)
+        loss_cov_reg_2 = cov_reg_loss(proj2_online, self.cov_reg_norm)
+        loss_cov_reg = loss_cov_reg_1 + loss_cov_reg_2
+
+        loss = loss_clr + self.loss_ratio * loss_cov_reg
+
+        return reps, (proj_online_, proj_target_), (loss_clr, loss_cov_reg, loss)
 
     def linear_probe(self, reps, labels, acc_top_1_fn, acc_top_5_fn):
         labels = labels.repeat(2)
@@ -232,14 +242,16 @@ class MultiHeadAttnMaskCLR(LightningModule):
 
     def training_step(self, batch, batch_idx):
         img, labels = batch
-        reps, proj_embed, loss = self.shared_step(img)
+        reps, proj_embed, losses = self.shared_step(img)
 
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
             reps.detach(), labels, self.train_acc_top_1, self.train_acc_top_5
         )
 
         self.log_dict({
-            'loss/pretrain/train': loss,
+            'loss/clr/train': losses[0],
+            'loss/cov_reg/train': losses[1],
+            'loss/pretrain/train': losses[-1],
             'loss/linear_probe/train': loss_xent,
             'acc/linear_probe_top_1/train': acc_top_1,
             'acc/linear_probe_top_5/train': acc_top_5,
@@ -247,23 +259,25 @@ class MultiHeadAttnMaskCLR(LightningModule):
             'norm/proj_online': proj_embed[0].norm(dim=-1).mean(),
             'norm/proj_target': proj_embed[1].norm(dim=-1).mean(),
         }, sync_dist=True)
-        return loss + loss_xent
+        return losses[-1] + loss_xent
 
     def validation_step(self, batch, batch_idx):
         img, labels = batch
-        reps, _, loss = self.shared_step(img)
+        reps, _, losses = self.shared_step(img)
 
         loss_xent, acc_top_1, acc_top_5 = self.linear_probe(
             reps.detach(), labels, self.val_acc_top_1, self.val_acc_top_5
         )
 
         self.log_dict({
-            'loss/pretrain/val': loss,
+            'loss/clr/val': losses[0],
+            'loss/cov_reg/val': losses[1],
+            'loss/pretrain/val': losses[-1],
             'loss/linear_probe/val': loss_xent,
             'acc/linear_probe_top_1/val': acc_top_1,
             'acc/linear_probe_top_5/val': acc_top_5,
         }, sync_dist=True)
-        return loss + loss_xent
+        return losses[-1] + loss_xent
 
     def configure_optimizers(self):
         param_groups = param_groups_lrd(
@@ -380,6 +394,10 @@ class MultiHeadAttnMaskCLR(LightningModule):
                             help="mask ratio of patches")
         parser.add_argument("--temperature", default=0.1, type=float,
                             help="atch-level temperature in loss")
+        parser.add_argument("--cov_reg_norm", default=False, action="store_true",
+                            help="use correlation instead of covariance")
+        parser.add_argument("--loss_ratio", default=0., type=float,
+                            help="coefficient on covariance regularization loss")
         parser.add_argument("--weight_decay", default=1e-6, type=float,
                             help="weight decay")
         parser.add_argument("--layer_decay", default=1., type=float,
