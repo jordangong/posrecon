@@ -40,7 +40,7 @@ class RandMaskedSimCLR(LightningModule):
             num_heads: int = 12,
             mlp_ratio: int = 4,
             proj_dim: int = 128,
-            drop_rate: float = 0.,
+            mlp_drop_rate: float = 0.,
             attention_drop_rate: float = 0.,
             drop_path_rate: float = 0.,
             weight_sharing: Optional[str] = None,
@@ -81,7 +81,7 @@ class RandMaskedSimCLR(LightningModule):
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
         self.proj_dim = proj_dim
-        self.drop_rate = drop_rate
+        self.mlp_drop_rate = mlp_drop_rate
         self.attention_drop_rate = attention_drop_rate
         self.drop_path_rate = drop_path_rate
         self.weight_sharing = weight_sharing
@@ -121,7 +121,7 @@ class RandMaskedSimCLR(LightningModule):
             num_heads,
             mlp_ratio,
             proj_dim,
-            drop_rate,
+            mlp_drop_rate,
             attention_drop_rate,
             drop_path_rate,
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
@@ -281,11 +281,11 @@ class RandMaskedSimCLR(LightningModule):
                             help="Ratio of embedding dim to MLP dim")
         parser.add_argument("--proj_dim", default=128, type=int,
                             help="projection head output dimension")
-        parser.add_argument("--mlp_dropout", default=0.0, type=float,
+        parser.add_argument("--mlp_drop_rate", default=0.0, type=float,
                             help="mlp dropout rate")
-        parser.add_argument("--attention_dropout", default=0.0, type=float,
+        parser.add_argument("--attention_drop_rate", default=0.0, type=float,
                             help="attention dropout rate")
-        parser.add_argument("--path_dropout", default=0.0, type=float,
+        parser.add_argument("--drop_path_rate", default=0.0, type=float,
                             help="path dropout rate")
         parser.add_argument("--weight_sharing", default=None, type=str,
                             help="ALBERT-style weight sharing, "
