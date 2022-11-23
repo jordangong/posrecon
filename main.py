@@ -1,6 +1,7 @@
 import copy
 from argparse import ArgumentParser, BooleanOptionalAction
 from functools import partial
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +12,7 @@ from pl_bolts.optimizers import linear_warmup_decay
 from pytorch_lightning import Trainer, LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
+from timm.models import vision_transformer
 from torch import nn
 from torchmetrics import Accuracy
 
@@ -54,6 +56,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
             optimizer: str = "adam",
             exclude_bn_bias: bool = False,
             learning_rate: float = 1e-3,
+            pretrained_target_net: Optional[str] = None,
             ema_momentum: float = 0.99,
             weight_decay: float = 1e-6,
             layer_decay: float = 1.,
@@ -99,6 +102,7 @@ class MultiHeadAttnMaskCLR(LightningModule):
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
         self.max_epochs = max_epochs
+        self.pretrained_target_net = pretrained_target_net
         self.ema_momentum = ema_momentum
 
         if dataset == "imagenet":
@@ -126,6 +130,15 @@ class MultiHeadAttnMaskCLR(LightningModule):
             partial(nn.LayerNorm, eps=1e-6),
         )
         self.target_net = copy.deepcopy(self.online_net)
+        if pretrained_target_net:
+            vit_size = "small" if embed_dim == 384 else "base"
+            pretrained_weight = vision_transformer.__dict__[
+                f"vit_{vit_size}_patch{patch_size}_224_{pretrained_target_net}"
+            ](pretrained=True).state_dict()
+            self.target_net.load_state_dict({
+                n: p
+                for n, p in pretrained_weight.items() if n != "pos_embed"
+            }, strict=False)
         self.classifier = nn.Linear(embed_dim, num_classes)
 
         self.train_acc_top_1 = Accuracy(top_k=1)
@@ -379,6 +392,8 @@ class MultiHeadAttnMaskCLR(LightningModule):
                             help="max steps")
         parser.add_argument("--warmup_epochs", default=10, type=int,
                             help="number of warmup epochs")
+        parser.add_argument("--pretrained_target_net", default=None, type=str,
+                            help="use pretrained target net for initialization")
         parser.add_argument("--ema_momentum", default=0.99, type=float,
                             help="ema momentum")
         parser.add_argument("--batch_size", default=128, type=int,
