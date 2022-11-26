@@ -410,8 +410,8 @@ class BlockWithAttentionWeight(Block):
         )
 
     def forward(self, x):
-        x, attn_weight = self.attn(self.norm1(x), self.attention_weight)
-        x = x + self.drop_path1(self.ls1(x))
+        x_, attn_weight = self.attn(self.norm1(x), self.attention_weight)
+        x = x + self.drop_path1(self.ls1(x_))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
 
         # Use dynamic return type here to make sequential module easier
